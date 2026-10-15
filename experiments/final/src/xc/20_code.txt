@@ -1,0 +1,89 @@
+from concurrent.futures import ThreadPoolExecutor
+RUN_DIR = os.path.join(OUT_DIR, RUN_NAME); os.makedirs(RUN_DIR, exist_ok=True)
+GEN_VAL, GEN_TEST = os.path.join(RUN_DIR, f"xc_val__{PRESET}.jsonl"), os.path.join(RUN_DIR, f"xc_test__{PRESET}.jsonl")
+_XPOOL, _XPRE = ThreadPoolExecutor(max_workers=IMG_WORKERS), ThreadPoolExecutor(max_workers=1)
+GEN_COLS = ["id", "split", "sample", "letter", "finish", "ntok", "A", "B", "text"]
+def _seed_of(qid): return int(hashlib.md5(f"{qid}|{SEED}".encode()).hexdigest(), 16) % (2 ** 31)
+def _xc_req(item):
+    r, A, B = item
+    return {"prompt": render_xc(r, A, B), "multi_modal_data": {"image": load_image(r["path"])}}
+def read_gen(path):
+    rows = []
+    if os.path.exists(path):
+        for line in open(path, encoding="utf-8"):
+            try: rows.append(json.loads(line))
+            except Exception: pass                         # 끊겨서 반쯤 쓴 줄
+    return pd.DataFrame(rows, columns=GEN_COLS)
+def _fix_tail(path):                   # 저장 도중 끊겨 마지막 줄이 줄바꿈 없이 끝났으면 줄바꿈을 붙여 다음 줄과 섞이지 않게
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        with open(path, "rb+") as f:
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) != b"\n": f.write(b"\n")
+def _items(df):
+    return [(r, *xc_pair(r["id"], LETTERS.index(r["anchor"]), LETTERS.index(r["alt"]))) for r in df.to_dict("records")]
+def _done_counts(path):
+    # 같은 문항·같은 A/B 짝으로 이미 뽑은 표본 수 (목록이 바뀌어 짝이 달라진 문항은 새로 판정)
+    d = read_gen(path)
+    if not len(d): return {}
+    return d.drop_duplicates(["id", "A", "B", "sample"], keep="last").groupby(["id", "A", "B"]).size().to_dict()
+def generate_xc(df, path, split):
+    _fix_tail(path)
+    cnt = _done_counts(path)
+    items = [(r, A, B) for r, A, B in _items(df) if cnt.get((r["id"], LETTERS[A], LETTERS[B]), 0) < K_SAMPLES]
+    print(f"[{split}] {os.path.basename(path)} | 대상 {len(df)}문항 | 완료 {len(df) - len(items)} | 남음 {len(items)} | 표본 {K_SAMPLES}개씩", flush=True)
+    if not items: return read_gen(path)
+    chunks = [items[i:i + GEN_CHUNK] for i in range(0, len(items), GEN_CHUNK)]
+    fut, t0, n, ntok = _XPRE.submit(lambda c: list(_XPOOL.map(_xc_req, c)), chunks[0]), time.time(), 0, 0
+    for k, ch in enumerate(chunks):
+        reqs = fut.result()
+        if k + 1 < len(chunks): fut = _XPRE.submit(lambda c: list(_XPOOL.map(_xc_req, c)), chunks[k + 1])
+        sps = [SamplingParams(n=K_SAMPLES, temperature=TEMPERATURE, top_p=TOP_P, top_k=TOP_K, max_tokens=MAX_TOKENS, seed=_seed_of(r["id"])) for r, _, _ in ch]
+        outs = llm.generate(reqs, sps, use_tqdm=False)
+        if len(outs) > len(ch):
+            print(f"  (엔진에 남아 있던 이전 요청 {len(outs) - len(ch)}개의 결과는 버림)"); outs = outs[-len(ch):]
+        assert len(outs) == len(ch) and all(getattr(o, "prompt", None) in (None, q["prompt"]) for o, q in zip(outs, reqs)), "요청과 결과의 순서가 맞지 않음"
+        with open(path, "a", encoding="utf-8") as f:
+            for (r, A, B), o in zip(ch, outs):
+                have = int(cnt.get((r["id"], LETTERS[A], LETTERS[B]), 0))
+                for j, c in enumerate(o.outputs[have:K_SAMPLES], start=have):
+                    f.write(json.dumps({"id": r["id"], "split": split, "sample": j, "letter": parse_answer(c.text), "finish": c.finish_reason,
+                                        "ntok": len(c.token_ids), "A": LETTERS[A], "B": LETTERS[B], "text": c.text}, ensure_ascii=False) + "\n")
+                    ntok += len(c.token_ids)
+        n += len(ch)
+        if k == 0:
+            _d = read_gen(path); _d = _d[_d.id.isin([r["id"] for r, _, _ in ch])]
+            print(f"  첫 묶음 점검: 답을 읽은 표본 {int(_d.letter.notna().sum())}/{len(_d)} | 길이 평균 {_d.ntok.mean():.0f}토큰 (최대 {_d.ntok.max()}) | 길이 제한에 걸림 {int((_d.finish == 'length').sum())}")
+            print("  예시 표본 끝부분:", repr(_d.text.iloc[0][-300:]))
+            if _d.letter.notna().mean() < 0.5:
+                raise RuntimeError("답을 읽어 낸 표본이 절반도 안 됩니다 → 마지막 줄 형식을 안 지키거나 길이 제한에 걸림. "
+                                   "'길이 제한에 걸림'이 많으면 1번 셀 MAX_TOKENS를 늘리고, 아니면 위 예시로 답 형식을 확인하세요")
+        if k == 0 or (k + 1) % 5 == 0 or k + 1 == len(chunks):
+            el = time.time() - t0
+            print(f"  {n:>4}/{len(items)}문항 | {el / n:.1f}s/문항 | 생성 {ntok / max(el, 1e-9):.0f}토큰/s | 남은 시간 ~{(len(items) - n) * el / n / 60:.0f}분", flush=True)
+    return read_gen(path)
+def counts_of(gen, df):
+    # 문항별 표본 답 수 (지금 목록의 A/B 짝으로 뽑은 표본만)
+    want = {r["id"]: (LETTERS[A], LETTERS[B]) for r, A, B in _items(df)}; out = {}
+    if not len(gen): return out
+    g = gen.drop_duplicates(["id", "A", "B", "sample"], keep="last")
+    for (qid, a_, b_), sub in g.groupby(["id", "A", "B"]):
+        if want.get(qid) != (a_, b_): continue
+        v = sub.letter.dropna(); v = v[v.isin(list(LETTERS))]
+        out[qid] = np.bincount(v.map(LETTERS.index).astype(int).to_numpy(), minlength=4)
+    return out
+def decide(c):
+    # 이 판정 모델의 한 표: 읽은 표본 ≥ MIN_VALID이고 1등이 하나일 때만. 아니면 기권(None)
+    if c is None or c.sum() < MIN_VALID: return None
+    w = np.flatnonzero(c == c.max()); return int(w[0]) if len(w) == 1 else None
+def preds_frame(ids, anchor_map, cnt):
+    # E14 형식: 판정한 문항은 표본 비율, 기권·목록 밖 문항은 기준 답(= 다른 보기에 표를 주지 않음)
+    rows = []
+    for i in ids:
+        a = LETTERS.index(anchor_map[i]); c = cnt.get(i); v = decide(c)
+        p = (c / c.sum()) if v is not None else np.eye(4)[a]
+        rows.append({"id": i, "pred": LETTERS[int(p.argmax())], "p_a": p[0], "p_b": p[1], "p_c": p[2], "p_d": p[3], "letter_mass": 1.0,
+                     "judged": int(v is not None), "vote": LETTERS[v] if v is not None else "", "n_valid": int(c.sum()) if c is not None else 0, "anchor": anchor_map[i]})
+    return pd.DataFrame(rows)
+SUMMARY = {"lines": []}
+def say(s): print(s); SUMMARY["lines"].append(s)
+print("✅ 생성 함수 준비 완료 | 저장:", RUN_DIR)

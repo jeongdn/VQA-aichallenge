@@ -1,0 +1,40 @@
+import os, subprocess, shutil, getpass, time
+from huggingface_hub import login, whoami, hf_hub_download
+HF_TOKEN = HF_TOKEN or os.environ.get("HF_TOKEN", "")
+if not HF_TOKEN: HF_TOKEN = getpass.getpass("Hugging Face 토큰(Write 권한, hf_로 시작)을 붙여 넣고 Enter: ").strip()
+login(token=HF_TOKEN, add_to_git_credential=False)
+HF_USER = whoami(token=HF_TOKEN)["name"]
+HF_REPO = HF_REPO or f"{HF_USER}/ssafy-vqa-private"
+print(f"Hugging Face 로그인: {HF_USER} | 비공개 저장소: {HF_REPO}")
+os.makedirs(DATA_DIR, exist_ok=True); os.makedirs(OUT_DIR, exist_ok=True)
+def _find_data_dir(root):
+    if os.path.exists(os.path.join(root, "train.csv")): return root
+    for d, _, fs in os.walk(root):
+        if "train.csv" in fs and "test.csv" in fs: return d
+    return None
+if _find_data_dir(DATA_DIR) is None:
+    if not os.path.exists(ZIP_PATH):
+        t0 = time.time(); print(f"대회 데이터 받는 중: {HF_REPO}/{HF_ZIP_NAME}")
+        try:
+            _got = hf_hub_download(HF_REPO, HF_ZIP_NAME, repo_type="dataset", token=HF_TOKEN, local_dir=os.path.dirname(ZIP_PATH))
+        except Exception as e:
+            raise SystemExit(f"❌ {HF_REPO}에서 {HF_ZIP_NAME}를 받지 못했습니다 ({type(e).__name__}: {str(e)[:200]})\n"
+                             "→ Colab 브리지 노트북 A 단계를 먼저 실행했는지 확인하세요. 또는 Jupyter 왼쪽 파일 창에 zip을 /workspace로 직접 올리세요.")
+        if os.path.abspath(_got) != os.path.abspath(ZIP_PATH): shutil.move(_got, ZIP_PATH)
+        print(f"  받음 {os.path.getsize(ZIP_PATH) / 1e9:.2f}GB ({time.time() - t0:.0f}초)")
+    t0 = time.time(); print("압축 해제 중... (몇 분)")
+    if shutil.which("7z") or shutil.which("unzip"):
+        _cmd = (["7z", "x", "-y", f"-p{ZIP_PASSWORD}", f"-o{DATA_DIR}", ZIP_PATH] if shutil.which("7z")
+                else ["unzip", "-q", "-o", "-P", ZIP_PASSWORD, ZIP_PATH, "-d", DATA_DIR])
+        _r = subprocess.run(_cmd, capture_output=True, text=True)
+        assert _r.returncode == 0, f"압축 해제 실패 ({_cmd[0]}) → 비밀번호·파일을 확인하세요:\n" + (_r.stdout or "")[-600:] + (_r.stderr or "")[-800:]
+    else:
+        import zipfile
+        with zipfile.ZipFile(ZIP_PATH) as _z: _z.extractall(DATA_DIR, pwd=ZIP_PASSWORD.encode())
+    print(f"  완료 ({time.time() - t0:.0f}초)")
+_dd = _find_data_dir(DATA_DIR)
+assert _dd is not None, f"압축을 풀었는데 {DATA_DIR} 아래에 train.csv가 없습니다 → zip 내용을 확인하세요"
+if _dd != DATA_DIR: print(f"train.csv가 하위 폴더에 있어 DATA_DIR을 바꿉니다: {_dd}"); DATA_DIR = _dd
+for f in ["train.csv", "test.csv", "sample_submission.csv"]:
+    assert os.path.exists(os.path.join(DATA_DIR, f)), f"{f} 가 {DATA_DIR} 에 없습니다"
+print("데이터 OK:", DATA_DIR, "| 결과 저장:", OUT_DIR)

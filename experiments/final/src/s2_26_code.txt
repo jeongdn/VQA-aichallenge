@@ -1,0 +1,9 @@
+print("RUN:", RUN_NAME, "| epoch별 검증 정확도:", {e: round(a * 100, 2) for e, a in state["epoch_acc"].items()})
+h = pd.DataFrame([x for x in state["history"] if "loss" in x])
+if len(h): print("loss 추이(처음→끝):", [round(v, 4) for v in h.loss.iloc[:: max(1, len(h) // 8)].tolist()])
+q = [(x["step"], round(x["quick_val_acc"] * 100, 1)) for x in state["history"] if "quick_val_acc" in x]
+if q: print("학습 중 빠른 검증(step, 정확도%):", q)
+lp = os.path.join(OUT_DIR, "results_log_s2.csv")
+if os.path.exists(lp):
+    L = pd.read_csv(lp); L = L[L.run.astype(str).str.startswith(RUN_NAME)]
+    print(L[[c for c in ["time", "run", "res", "tta", "n", "acc", "ci95", "letter_mass"] if c in L.columns]].tail(12).to_string(index=False))

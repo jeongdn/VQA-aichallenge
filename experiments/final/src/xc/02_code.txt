@@ -1,0 +1,84 @@
+MODEL_ID  = "google/gemma-4-31B-it"   # ← 판정 모델. 여기만 바꾸세요. 추천 순서: google/gemma-4-31B-it → Qwen/Qwen3.5-122B-A10B-GPTQ-Int4 → naver-hyperclovax/HyperCLOVAX-SEED-Think-32B
+PRESET    = "up2.0"                   # 해상도 (다른 멤버와 같음)
+RUN_NAME  = "auto"                    # "auto" → xc_<모델 이름>_<해상도>
+TARGETS_FILE = ""                     # 판정 목록. 비워 두면 HF 비공개 저장소의 xcheck/xcheck_targets.csv (Colab anchor_rescue 6-1번 셀이 올림). 직접 올렸으면 그 파일 경로
+
+# ── 교차 검증 프롬프트 생성 (결과를 보기 전에 고정 · 판정 모델 모두 같은 값) ──
+K_SAMPLES   = 5                       # 문항당 표본 수 → 다수결 = 이 판정 모델의 한 표
+TEMPERATURE, TOP_P, TOP_K = 0.7, 0.8, 20
+MAX_TOKENS  = 1200                    # 단계별 풀이 + 마지막 줄 '정답: (x)'. 첫 묶음 점검에서 '길이 제한에 걸림'이 많으면 늘림
+MIN_VALID   = 3                       # 답을 읽어 낸 표본이 이보다 적거나 최다 표가 동점이면 기권 (= 표를 내지 않음)
+THINKING    = False                   # 생각 모드 끔 (템플릿이 지원할 때만 적용)
+GEN_CHUNK   = 32                      # 한 번에 넘기는 문항 수 = 저장 단위
+GPU_ID    = None                      # GPU 여러 장 pod에서 노트북 여러 개를 동시에: 노트북마다 0, 1, 2, … (None = 전부 보이게)
+VAL_N, PROMPT_VERSION_USE, ANSWER_PREFIX = 1000, "baseline_v1", ""   # 아래 공용 셀용 (바꾸지 마세요)
+
+# ── 모델별 설정 (여기 없는 모델은 아래 공통 기본값) ──
+MODEL_PRESETS = {
+    "google/gemma-4-31B-it":            {},                                   # 판정 1순위: zero-shot 97.67% (앞 300문항) · Qwen과 다른 계열. 라이선스 동의 + HF 토큰
+    "Qwen/Qwen3.5-122B-A10B-GPTQ-Int4": {"QUANTIZATION": "moe_wna16"},       # 판정 2순위 (zero-shot 검증 96.0%)
+    "naver-hyperclovax/HyperCLOVAX-SEED-Think-32B": {"TRUST_REMOTE_CODE": True},   # 판정 3순위: 네이버·한국어 (95.67%). vLLM 지원이 불확실 → 로드가 안 되면 건너뜀
+    "OpenGVLab/InternVL3_5-38B-HF":     {},                                   # 선택 (94.33%)
+    "Qwen/Qwen3.5-27B":                 {},                                   # 선택 (96.33%, 122B와 같은 계열)
+    "Qwen/Qwen3.6-35B-A3B":             {},                                   # 선택 (96.33%, 122B와 같은 계열)
+}
+# ── 공통 기본값 (vLLM) ──
+DTYPE         = "auto"          # 체크포인트 dtype 그대로 (bf16)
+QUANTIZATION  = None            # 양자화 판은 MODEL_PRESETS에서 정함
+TRUST_REMOTE_CODE = False
+MOE_BACKEND   = "triton"        # B300: FlashInfer MoE 커널은 즉석 컴파일이 필요한데 pod의 nvcc가 B300(sm_103)을 몰라 실패 → Triton (MoE 모델만 해당)
+ATTN_BACKEND  = "TRITON_ATTN"   # B300: 같은 이유로 FlashInfer 어텐션 대신 Triton 어텐션. None = vLLM 자동 선택(G4·H100 등)
+GPU_MEM_UTIL  = 0.92
+MAX_MODEL_LEN = 8192
+MAX_NUM_SEQS  = 64              # 생성은 표본 여러 개를 동시에 돌려야 빠름 (시작이 실패하면 32)
+MAX_BATCHED_TOKENS = 32768
+TOPK_LOGPROBS = 64
+CHUNK         = 128             # 한 번에 넘기는 문항 수 = 저장 단위
+IMG_WORKERS   = 8
+GDN_PREFILL_BACKEND = "triton"  # Qwen3.5 계열 선형 어텐션 커널 (다른 모델에는 영향 없음)
+ENGINE_KW     = {}
+for _k, _v in MODEL_PRESETS.get(MODEL_ID, {}).items(): globals()[_k] = _v
+if ATTN_BACKEND: ENGINE_KW.setdefault("attention_config", {"backend": ATTN_BACKEND})
+ENGINE_KW.setdefault("enable_flashinfer_autotune", False)   # FlashInfer 자동 튜닝(즉석 컴파일)도 건너뜀 → "nvcc fatal: Unsupported gpu architecture 'compute_103a'" 방지
+
+import re as _re
+if RUN_NAME == "auto":
+    RUN_NAME = "xc_" + _re.sub(r"[^a-z0-9]+", "_", MODEL_ID.split("/")[-1].lower()).strip("_") + "_" + PRESET.replace(".", "") + ("" if PROMPT_VERSION_USE == "baseline_v1" else "_" + PROMPT_VERSION_USE)
+VAL_ORDER_SEED = 2026           # 앞 1,000(팀 공통 검증) 뒤의 train 5,714문항 순서 (고정)
+
+# ── RunPod 경로 (바꾸지 마세요. 모두 볼륨 디스크 /workspace 안) ──
+ZIP_PATH     = "/workspace/ssafy-16-2-ai.zip"   # 대회 데이터 zip. 없으면 3번 셀이 HF 비공개 저장소에서 받음
+ZIP_PASSWORD = "YOUR_ZIP_PASSWORD"
+DATA_DIR     = "/workspace/data"
+OUT_DIR      = "/workspace/vqa_runs"
+HF_CACHE     = "/workspace/hf"                  # 가중치 캐시는 볼륨 디스크의 이 한 곳 (Flash-Next 노트북·터미널 다운로드와 같은 곳)
+HF_REPO      = ""                               # 비워 두면 "<내 HF 아이디>/ssafy-vqa-private" (Colab 브리지 노트북과 같은 규칙)
+HF_ZIP_NAME  = "ssafy-16-2-ai.zip"
+SEED, VAL_SIZE = 42, 1000
+HF_TOKEN   = ""                 # 비워 두면 pod 환경 변수 HF_TOKEN → 그것도 없으면 3번 셀에서 입력창 (Write 권한 토큰. Gemma는 라이선스 동의한 계정)
+
+RES_PRESETS = {
+    "baseline384": (384 * 384, 384 * 384),
+    "mid":         (256 * 28 * 28, 512 * 28 * 28),
+    "native":      (256 * 28 * 28, 1280 * 28 * 28),
+    "up1.5":       (1_550_000, 2_100_000),
+    "up2.0":       (2_700_000, 3_400_000),
+}
+RES_PRESETS_GEMMA4 = {"baseline384": 70, "mid": 140, "native": 280, "up1.5": 560, "up2.0": 1120}   # stage2와 같음 (Gemma 4는 이미지당 토큰 수)
+print(f"MODEL_ID = {MODEL_ID} | RUN_NAME = {RUN_NAME} | PRESET = {PRESET} | 표본 {K_SAMPLES}개 · T {TEMPERATURE} · 최대 {MAX_TOKENS}토큰 | 설정 덮어쓰기 {MODEL_PRESETS.get(MODEL_ID, {}) or '없음 (기본값)'}")
+
+import os, sys
+# vLLM이 같이 까는 torchaudio(CUDA 12.8용)가 torch 2.13(CUDA 13)과 섞이면 import 순간 RuntimeError가 남 (2번 셀이 지우지만, 셀 순서가 꼬여도 안전하게)
+# (transformers의 AutoProcessor와 vLLM이 torchaudio가 '있으면' 불러옴). 이 노트북은 오디오를 쓰지 않으므로
+# 이 프로세스에서는 torchaudio를 '없는 것'으로 취급 → 둘 다 torchaudio 없이 동작. 반드시 transformers·vLLM보다 먼저 실행되는 이 셀에 둠
+sys.modules["torchaudio"] = None
+if GPU_ID is not None:
+    assert "torch" not in sys.modules, "GPU_ID는 커널을 새로 시작한 직후에만 적용됩니다 → Kernel → Restart Kernel and Run All Cells"
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(GPU_ID); print(f"이 노트북은 GPU {GPU_ID}번만 씁니다")
+_HF_PRE = {k: os.environ[k] for k in ("HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_XET_CACHE") if os.environ.get(k) and not os.environ[k].startswith(HF_CACHE)}
+os.environ.update({"HF_HOME": HF_CACHE, "HF_HUB_CACHE": HF_CACHE + "/hub", "HF_XET_CACHE": HF_CACHE + "/xet"}); os.environ.pop("HUGGINGFACE_HUB_CACHE", None)   # pod에 미리 정해진 캐시 경로를 덮어써 두 번 받지 않게
+if _HF_PRE: print(f"(pod에 미리 정해진 HF 캐시 경로 {_HF_PRE} 대신 {HF_CACHE} 하나만 씁니다)")
+assert os.path.isdir("/workspace"), "/workspace가 없습니다 → pod 설정에서 Volume Disk(마운트 경로 /workspace)를 켰는지 확인하세요"
+os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")             # 대용량 다운로드 가속
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")      # vLLM 엔진을 노트북 프로세스 안에서 실행 (Colab의 fork/spawn 문제 회피)
+os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")         # 초기화 때 top-k/top-p 표본 추출을 FlashInfer(JIT 컴파일 필요)로 시험하지 않게 → PyTorch판. 이 노트북은 그리디 1토큰이라 무관

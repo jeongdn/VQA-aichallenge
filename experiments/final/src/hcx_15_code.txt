@@ -1,0 +1,153 @@
+import torch.nn.functional as F
+from transformers import AutoProcessor, AutoModelForImageTextToText, AutoModelForCausalLM, BitsAndBytesConfig, get_cosine_schedule_with_warmup
+from peft import LoraConfig, get_peft_model, PeftModel, set_peft_model_state_dict, load_peft_weights, prepare_model_for_kbit_training
+import transformers, peft
+print("transformers", transformers.__version__, "| peft", peft.__version__, "| torch", torch.__version__)
+
+import gc
+for _v in ("model", "base", "optimizer", "scheduler", "params", "loss", "enc", "logits", "out", "gnorm"):   # 이전 모델·중단된 학습의 그래프가 GPU에 남아 OOM 나는 것 방지
+    if _v in globals(): del globals()[_v]
+gc.collect()
+if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+if DEVICE == "cuda":
+    GPU_NAME = torch.cuda.get_device_name(0); cap = torch.cuda.get_device_capability(0)
+    BF16_NATIVE = cap[0] >= 8
+    VRAM_GB = torch.cuda.get_device_properties(0).total_memory / 2**30
+else:
+    GPU_NAME, BF16_NATIVE, VRAM_GB = "cpu", False, 0.0
+if DEVICE == "cpu":   DTYPE, use_4bit = torch.float32, False
+elif BF16_NATIVE:
+    _big = re.search(r"(?<![\d.])(2\d|3\d|7\d)B", str(MODEL_ID)) is not None
+    DTYPE, use_4bit = torch.bfloat16, (USE_4BIT is True or (USE_4BIT == "auto" and (VRAM_GB < 30 or _big)))
+else:                 DTYPE, use_4bit = torch.float16, (USE_4BIT is not False)
+USE_FP16_SCALER = (DEVICE == "cuda" and not BF16_NATIVE)
+BS = (8 if VRAM_GB >= 38 else 4 if VRAM_GB >= 20 else 2) if BATCH_SIZE == "auto" else int(BATCH_SIZE)
+print(f"GPU: {GPU_NAME} ({VRAM_GB:.0f}GB) | dtype={DTYPE} | 4bit={use_4bit} | 평가 배치={BS} | 학습 배치={MICRO_BS}x{GRAD_ACCUM}")
+
+import shutil
+RUN_DIR = os.path.join(OUT_DIR, RUN_NAME + ("_dry" if DRY_RUN else ""))
+CKPT_DIR = os.path.join(RUN_DIR, "ckpt_last")
+if DRY_RUN and os.path.exists(RUN_DIR): shutil.rmtree(RUN_DIR)          # 점검용 실행은 항상 처음부터
+os.makedirs(RUN_DIR, exist_ok=True)
+if not os.path.exists(CKPT_DIR) and os.path.exists(os.path.join(CKPT_DIR + "_tmp", "trainer_state.pt")):
+    os.replace(CKPT_DIR + "_tmp", CKPT_DIR)                              # 저장 직후 교체 단계에서 끊긴 경우 복구
+
+load_kw = dict(dtype=DTYPE, attn_implementation="sdpa")
+if DEVICE == "cuda": load_kw["device_map"] = {"": 0}
+if use_4bit:
+    load_kw["quantization_config"] = BitsAndBytesConfig(
+        load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=DTYPE,
+        llm_int8_skip_modules=["lm_head", ".*visual.*", ".*vision_tower.*", ".*vision_model.*", ".*multi_modal_projector.*", ".*projector.*", ".*embed_vision.*", ".*audio_tower.*", ".*embed_audio.*"])
+
+_TRC = bool(globals().get("TRUST_REMOTE_CODE", False))       # 저장소의 커스텀 코드로 올라오는 모델(A.X 등)
+processor = AutoProcessor.from_pretrained(MODEL_ID, **({"trust_remote_code": True} if _TRC else {}))
+processor.tokenizer.padding_side = "left"
+tok = processor.tokenizer
+_pname = type(processor).__name__
+FAMILY = "gemma4" if _pname.startswith("Gemma4") else "internvl" if _pname.startswith("InternVL") else "qwen"     # 프로세서 계열 (해상도 인자·이미지 전달 방식이 다름)
+_ip = getattr(processor, "image_processor", None)
+if _TRC and FAMILY == "qwen" and not (hasattr(_ip, "merge_size") or hasattr(_ip, "min_pixels")):
+    FAMILY = "generic"      # 커스텀 프로세서: 해상도 인자를 모르므로 모델 기본 전처리를 그대로 씀 (up 프리셋은 이미지 자체를 확대)
+IMAGE_TOKEN_ID = getattr(processor, "image_token_id", None)
+if IMAGE_TOKEN_ID is None: IMAGE_TOKEN_ID = tok.convert_tokens_to_ids(getattr(processor, "image_token", "<|image_pad|>"))
+_tmpl = processor.chat_template if isinstance(processor.chat_template, str) else json.dumps(processor.chat_template)
+TEMPLATE_KW = {"enable_thinking": False} if "enable_thinking" in (_tmpl or "") else {}
+# HyperCLOVA X는 변수 이름이 thinking (기본값도 비사고 모드: 빈 <think></think> 블록). 명시적으로 끔
+if not TEMPLATE_KW and _pname.startswith("HyperCLOVAX") and re.search(r"\bthinking\b", _tmpl or ""):
+    TEMPLATE_KW = {"thinking": False}
+SYSTEM_AS_STRING = False
+_PROBE_ROW = {"question": "q", "a": "1", "b": "2", "c": "3", "d": "4"}
+_raw_list = lambda t: "'type': 'text'" in t or '"type": "text"' in t      # 목록형 content가 풀리지 않고 글자 그대로 찍혔는지
+try:
+    _probe = processor.apply_chat_template(build_messages(_PROBE_ROW), tokenize=False, add_generation_prompt=True, **TEMPLATE_KW); USE_SYSTEM_ROLE = True
+    if _raw_list(_probe):                      # 템플릿이 목록형 system 내용을 그대로 찍음 (EXAONE 4.5 공식 템플릿 등)
+        SYSTEM_AS_STRING = True
+        _probe = processor.apply_chat_template(build_messages(_PROBE_ROW), tokenize=False, add_generation_prompt=True, **TEMPLATE_KW)
+        if _raw_list(_probe):
+            SYSTEM_AS_STRING = False; USE_SYSTEM_ROLE = False; print("system 내용이 풀리지 않는 템플릿 → 지시문을 user 메시지 앞에 붙입니다")
+        else:
+            print("템플릿이 목록형 system 내용을 풀지 못함 → system 지시문을 문자열로 넣습니다")
+except Exception as _e:
+    USE_SYSTEM_ROLE = False; print("system 역할 미지원 템플릿 → 지시문을 user 메시지 앞에 붙입니다")
+# 생각(추론) 모드가 열린 채 끝나는 템플릿(HyperCLOVA X 등)이면 빈 생각 블록을 닫아, 첫 토큰에서 바로 답하게 함
+_probe = processor.apply_chat_template(build_messages(_PROBE_ROW), tokenize=False, add_generation_prompt=True, **TEMPLATE_KW)
+CLOSE_THINK = _probe.endswith("<think>\n") or _probe.endswith("<think>")
+def _fix_prompt(t):
+    if CLOSE_THINK and t.endswith("<think>\n"): return t + "\n</think>\n\n"
+    if CLOSE_THINK and t.endswith("<think>"): return t + "\n\n</think>\n\n"
+    return t
+if CLOSE_THINK: print("⚠️ 템플릿이 생각 모드를 연 채 끝남 → 프롬프트 끝에 빈 생각 블록을 닫아 붙입니다")
+print("프롬프트 미리보기(앞):", repr(_fix_prompt(_probe)[:220]))
+print("프롬프트 미리보기(끝):", repr(_fix_prompt(_probe)[-90:]))
+if _TRC and not hasattr(processor, "image_token_id") and not hasattr(processor, "image_token"):
+    for _t in ("<image>", "<|image|>", "<|image_pad|>", "<IMG_CONTEXT>", "<img>"):
+        if _t in (globals().get("_probe") or "") and tok.convert_tokens_to_ids(_t) not in (None, tok.unk_token_id):
+            IMAGE_TOKEN_ID = tok.convert_tokens_to_ids(_t); break
+print(f"계열: {FAMILY} | 이미지 토큰 id: {IMAGE_TOKEN_ID} | chat template 추가 인자: {TEMPLATE_KW} | system 역할: {USE_SYSTEM_ROLE}")
+t0 = time.time()
+if _TRC: load_kw["trust_remote_code"] = True
+def _load(cls, kw):
+    try: return cls.from_pretrained(MODEL_ID, **kw)
+    except ValueError as e:
+        _m = str(e).lower()
+        if _TRC and kw.get("attn_implementation") == "sdpa" and ("sdpa" in _m or "scaled_dot_product_attention" in _m or "attn_implementation" in _m):
+            print("sdpa 어텐션 미지원 모델 → eager로 로드"); return cls.from_pretrained(MODEL_ID, **{**kw, "attn_implementation": "eager"})
+        raise
+try:
+    base = _load(AutoModelForImageTextToText, load_kw)
+except (ValueError, KeyError) as e:
+    if not _TRC: raise
+    print("이미지-텍스트 자동 클래스로는 불러올 수 없는 커스텀 모델 → AutoModelForCausalLM으로 로드")
+    base = _load(AutoModelForCausalLM, load_kw)
+base.config.use_cache = False
+if use_4bit and not BF16_NATIVE:
+    try: base = prepare_model_for_kbit_training(base, use_gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False})
+    except ValueError as e:
+        if not _TRC: raise
+        print("⚠️ 그래디언트 체크포인팅 미지원 모델 → 체크포인팅 없이 4bit 준비"); base = prepare_model_for_kbit_training(base, use_gradient_checkpointing=False)
+else:
+    try: base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    except Exception as e:
+        if not _TRC: raise
+        print("⚠️ 그래디언트 체크포인팅 미지원 모델 → 끄고 진행 (메모리 부족 시 마이크로 배치가 자동으로 줄어듭니다):", str(e)[:100])
+print(f"모델 로드 {time.time() - t0:.0f}s | {type(base).__name__}")
+
+LORA_TARGETS = r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|in_proj_qkv|in_proj_z|out_proj)"
+if _TRC and not any(re.fullmatch(LORA_TARGETS, n) for n, _ in base.named_modules()):
+    LORA_TARGETS = r"(?i)^(?!.*(vision|visual|siglip|image|img|projector|connector|resampler|merger|abstractor|aligner)).*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
+    print("언어 모델 경로 이름이 달라('language_model' 없음) 비전·투영 모듈을 뺀 선형층에 LoRA를 붙입니다")
+RESUMING = os.path.exists(os.path.join(CKPT_DIR, "trainer_state.pt"))
+if RESUMING:
+    model = PeftModel.from_pretrained(base, os.path.join(CKPT_DIR, "adapter"), is_trainable=True)
+    print("↩️ 체크포인트에서 어댑터를 불러왔습니다:", CKPT_DIR)
+else:
+    torch.manual_seed(TRAIN_SEED)                                        # LoRA 초기화 시드
+    model = get_peft_model(base, LoraConfig(r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT, bias="none",
+                                            target_modules=LORA_TARGETS))
+# PEFT는 체크포인팅이 켜져 있으면 '입력 임베딩 출력에 grad 요구' 훅을 거는데, transformers 5.x에서는 이 훅이 비전 타워에도 걸려
+# 얼려 둔 비전 타워 전체가 역전파 그래프에 들어갑니다(메모리·시간 낭비). 비재진입(non-reentrant) 체크포인팅에서는 필요 없으므로 제거합니다.
+if hasattr(base, "disable_input_require_grads") and getattr(base, "_require_grads_hooks", None):
+    base.disable_input_require_grads(); print("입력-grad 훅 제거 (비전 타워는 역전파에서 제외)")
+if "qwen3_5" in str(getattr(base.config, "model_type", "")):
+    import importlib.util
+    if importlib.util.find_spec("fla") is None:
+        print("⚠️⚠️ flash-linear-attention이 없습니다 → 선형 어텐션이 순수 PyTorch로 돌아 OOM/저속 위험. 2번 셀을 실행하고 '세션 다시 시작' 후 처음부터 실행하세요.")
+    else:
+        print("✅ flash-linear-attention 커널 사용")
+model.print_trainable_parameters()
+n_lora = sum(1 for n, _ in model.named_modules() if n.endswith("lora_A"))
+n_lora_vis = sum(1 for n, _ in model.named_modules() if n.endswith("lora_A") and any(k in n for k in ("visual", "vision", "siglip")))
+print(f"LoRA가 붙은 층: {n_lora}개 (비전 타워 {n_lora_vis}개 — 0이어야 정상)")
+assert n_lora > 0 and n_lora_vis == 0
+
+LETTER_IDS = []                                     # 첫 번째(소문자·공백 없음)가 학습 목표, 나머지 변형은 확률 집계용
+for L in LETTERS:
+    ids = []
+    for s in (L, L.upper(), " " + L, " " + L.upper()):
+        t = tok.encode(s, add_special_tokens=False)
+        if len(t) == 1 and t[0] not in ids: ids.append(t[0])
+    assert ids and len(tok.encode(L, add_special_tokens=False)) == 1, f"'{L}' 가 단일 토큰이 아닙니다"
+    LETTER_IDS.append(ids)
+print("글자 토큰 id:", dict(zip(LETTERS, LETTER_IDS)))

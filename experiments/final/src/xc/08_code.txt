@@ -1,0 +1,55 @@
+import re, json, time, math, hashlib, random, datetime, glob
+import numpy as np, pandas as pd, torch
+from PIL import Image, ImageOps
+Image.MAX_IMAGE_PIXELS = None
+random.seed(SEED); np.random.seed(SEED)
+
+train_df = pd.read_csv(os.path.join(DATA_DIR, "train.csv"))
+test_df  = pd.read_csv(os.path.join(DATA_DIR, "test.csv"))
+sub_df   = pd.read_csv(os.path.join(DATA_DIR, "sample_submission.csv"))
+dev_df   = pd.read_csv(os.path.join(DATA_DIR, "dev.csv")) if os.path.exists(os.path.join(DATA_DIR, "dev.csv")) else None
+for c in ["question", "a", "b", "c", "d"]:
+    train_df[c] = train_df[c].astype(str); test_df[c] = test_df[c].astype(str)
+train_df["answer"] = train_df["answer"].astype(str).str.strip().str.lower()
+assert set(train_df.answer.unique()) <= set("abcd"), train_df.answer.unique()
+assert list(test_df.id) == list(sub_df.id), "test.csv 와 sample_submission.csv 의 id 순서가 다릅니다"
+print(f"train {len(train_df):,} | test {len(test_df):,} | dev {0 if dev_df is None else len(dev_df):,}")
+print("정답 분포:", train_df.answer.value_counts().sort_index().to_dict())
+
+def img_path(rel):            # CSV의 path 컬럼은 DATA_DIR 기준 상대경로
+    return os.path.join(DATA_DIR, rel)
+
+EXPECTED_SPLIT_MD5 = "df05e4bc19d27ebceeef2570672149c2"
+
+def make_split(df, val_size=VAL_SIZE, seed=SEED):
+    rng = np.random.RandomState(seed)
+    val_idx = []
+    for letter in "abcd":
+        idx = np.where(df.answer.values == letter)[0]
+        rng.shuffle(idx)
+        val_idx.extend(idx[: val_size // 4].tolist())
+    val_idx = sorted(val_idx)
+    mask = np.zeros(len(df), dtype=bool); mask[val_idx] = True
+    return df[~mask].reset_index(drop=True), df[mask].reset_index(drop=True)
+
+tr_df, val_df = make_split(train_df)
+split_md5 = hashlib.md5(",".join(val_df.id.tolist()).encode()).hexdigest()
+print(f"train {len(tr_df):,} / valid {len(val_df):,} | split md5 = {split_md5}")
+print("valid 정답 분포:", val_df.answer.value_counts().sort_index().to_dict())
+if split_md5 == EXPECTED_SPLIT_MD5:
+    print("✅ 팀 공통 분할과 일치")
+else:
+    print("⚠️⚠️ 검증 분할이 기준과 다릅니다 → 팀원 간 점수 비교 불가. train.csv 원본/SEED/VAL_SIZE를 확인하세요.")
+val_df[["id"]].to_csv(os.path.join(OUT_DIR, "valid_ids.csv"), index=False)
+
+# E14 조합(검증 97.6%)의 오답 24개 — 라벨 오류 10 · 둘 다 답 8 · 진짜 실수 6 (OCR 실험 때와 같은 목록)
+E14_ERR = {"라벨 오류": "0175 1878 3551 4755 6545 2114 4801 3823 6130 6211", "둘 다 답": "5008 1900 1911 2910 5811 2462 2186 1785",
+           "진짜 실수": "2112 0936 5797 5209 1045 1000"}
+E14_ERR = {k: [f"train_{x}.jpg" for x in v.split()] for k, v in E14_ERR.items()}
+
+_rest = tr_df.sample(frac=1.0, random_state=VAL_ORDER_SEED)
+VAL_ALL = pd.concat([val_df, _rest], ignore_index=True)
+assert VAL_ALL.id.is_unique and len(VAL_ALL) == len(train_df)
+VAL_USE = VAL_ALL.head(int(VAL_N)).copy()
+FIXED_VAL_IDS = set(val_df.id)
+print(f"검증 {len(VAL_USE):,}문항 사용 (팀 공통 {int(VAL_USE.id.isin(FIXED_VAL_IDS).sum()):,} + 나머지 {int((~VAL_USE.id.isin(FIXED_VAL_IDS)).sum()):,}) | test {len(test_df):,}")

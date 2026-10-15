@@ -1,0 +1,2 @@
+print(f"판정 | {MODEL_ID} | {RUN_NAME} | 목록 {TG_TAG} (기준 {XC_ANCHOR}) | 표본 {K_SAMPLES} · T {TEMPERATURE} · 최대 {MAX_TOKENS}토큰 · 생각 {THINKING} | vllm {vllm.__version__} | {GPU_NAME}")
+for _l in SUMMARY["lines"]: print(_l)

@@ -1,0 +1,23 @@
+import os, subprocess
+try:
+    from google.colab import drive
+    drive.mount("/content/drive")
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+
+if IN_COLAB and not os.path.exists(os.path.join(DATA_DIR, "train.csv")):
+    print("압축 해제 중... (몇 분 걸립니다)")
+    r = subprocess.run(["7z", "x", "-y", f"-p{ZIP_PASSWORD}", f"-o{DATA_DIR}", DRIVE_ZIP],
+                       capture_output=True, text=True)
+    print(r.stdout[-400:]); assert r.returncode == 0, r.stderr[-800:]
+if not HF_TOKEN and IN_COLAB:
+    try:
+        from google.colab import userdata; HF_TOKEN = userdata.get("HF_TOKEN") or ""
+    except Exception: pass
+if HF_TOKEN:
+    from huggingface_hub import login; login(token=HF_TOKEN, add_to_git_credential=False); print("Hugging Face 로그인 완료")
+os.makedirs(OUT_DIR, exist_ok=True)
+for f in ["train.csv", "test.csv", "sample_submission.csv"]:
+    assert os.path.exists(os.path.join(DATA_DIR, f)), f"{f} 가 {DATA_DIR} 에 없습니다. DATA_DIR / 압축 비밀번호를 확인하세요."
+print("데이터 OK:", DATA_DIR, "| 결과 저장:", OUT_DIR)

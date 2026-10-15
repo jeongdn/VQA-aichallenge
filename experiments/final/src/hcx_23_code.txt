@@ -1,0 +1,41 @@
+import base64, io, html as _html
+def export_error_report(m, path, max_items=150):
+    wrong = m[~m.correct].head(max_items); parts = [f"<h2>{_html.escape(os.path.basename(path))} — 오답 {int((~m.correct).sum())}건 / {len(m)}문항</h2>"]
+    for _, r in wrong.iterrows():
+        im = load_image(r.path); im.thumbnail((560, 560)); buf = io.BytesIO(); im.save(buf, "JPEG", quality=72)
+        opts = "".join(f"<li>({k}) {_html.escape(str(r[k]))} — p={r['p_' + k]:.2f}{' <b>← 정답</b>' if k == r.answer else ''}{' <b style=color:#c00>← 예측</b>' if k == r.pred else ''}</li>" for k in LETTERS)
+        parts.append(f"<div style='display:flex;gap:16px;margin:18px 0;border-top:1px solid #ccc;padding-top:12px'><img src='data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}'>"
+                     f"<div><b>{r.id}</b><p>{_html.escape(str(r.question))}</p><ul>{opts}</ul></div></div>")
+    open(path, "w", encoding="utf-8").write("<meta charset='utf-8'><body style='font-family:sans-serif;max-width:1100px;margin:auto'>" + "".join(parts))
+    print("오답 리포트 저장:", path)
+
+if not DRY_RUN and state["global_step"] < total_steps:
+    raise RuntimeError(f"학습이 아직 끝나지 않았습니다 ({state['global_step']}/{total_steps} 스텝). 1번 셀부터 다시 실행하면 체크포인트에서 이어서 학습합니다.")
+if not DRY_RUN and state["epoch_acc"]:
+    best_ep = max(state["epoch_acc"], key=lambda e: (state["epoch_acc"][e], e))     # 동률이면 더 오래 학습한 쪽
+    print("epoch별 검증 정확도:", {e: round(a * 100, 2) for e, a in state["epoch_acc"].items()}, "→ 사용할 어댑터: epoch", best_ep)
+    set_peft_model_state_dict(model, load_peft_weights(os.path.join(RUN_DIR, f"adapter_ep{best_ep}"), device="cpu"))
+    FINAL_TAG = f"final_ep{best_ep}"
+else:
+    FINAL_TAG = "final_dry"
+model.eval()
+final_eval_df = val_df if not DRY_RUN else quick_df
+summary = []
+for preset in (EVAL_PRESETS if not DRY_RUN else [TRAIN_PRESET]):
+    set_resolution(preset)
+    if not DRY_RUN and preset == TRAIN_PRESET:                    # epoch 끝 평가와 같은 모델·해상도 → 그 결과를 그대로 재사용
+        _src = os.path.join(RUN_DIR, f"preds_ep{best_ep}__{preset}__{len(final_eval_df)}.csv")
+        _dst = os.path.join(RUN_DIR, f"preds_{FINAL_TAG}__{preset}__{len(final_eval_df)}.csv")
+        if os.path.exists(_src) and not os.path.exists(_dst): shutil.copy(_src, _dst)
+    acc, m = evaluate(final_eval_df, FINAL_TAG, tta=False)
+    summary.append({"해상도": preset, "TTA": False, "정확도(%)": round(acc * 100, 2)})
+    export_error_report(m, os.path.join(RUN_DIR, f"error_report_{FINAL_TAG}_{preset}.html"))
+BEST_PRESET = max(summary, key=lambda s: s["정확도(%)"])["해상도"]        # 동률이면 앞에 적은(=더 싼) 해상도
+if EVAL_TTA:
+    set_resolution(BEST_PRESET)
+    acc, _ = evaluate(final_eval_df, FINAL_TAG, tta=True, by_type=False)
+    summary.append({"해상도": BEST_PRESET, "TTA": True, "정확도(%)": round(acc * 100, 2)})
+print("\n" + pd.DataFrame(summary).to_string(index=False))
+print(f"→ 제출 권장 해상도: {BEST_PRESET}")
+if TRAIN_ON_FULL: print("⚠️ TRAIN_ON_FULL=True: 검증셋을 학습에 썼으므로 위 점수는 의미가 없습니다 (제출용 모델).")
+set_resolution(TRAIN_PRESET)

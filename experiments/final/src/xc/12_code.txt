@@ -1,0 +1,20 @@
+from huggingface_hub import hf_hub_download
+if TARGETS_FILE:
+    _tp = TARGETS_FILE
+else:
+    _tp = hf_hub_download(HF_REPO, "xcheck/xcheck_targets.csv", repo_type="dataset", token=HF_TOKEN or None, force_download=True, local_dir="/workspace/xcheck")
+assert os.path.exists(_tp), f"판정 목록이 없습니다: {_tp}"
+TG = pd.read_csv(_tp)
+_need = {"id", "split", "anchor", "alt", "n_alt", "target", "list_tag", "anchor_run"}
+assert _need <= set(TG.columns), f"판정 목록 열이 부족합니다: {list(TG.columns)} → Colab anchor_rescue 6-1번 셀이 만든 파일인지 확인하세요"
+TG_TAG, XC_ANCHOR = str(TG.list_tag.iloc[0]), str(TG.anchor_run.iloc[0])
+_tv, _tt = TG[TG.split == "val"].set_index("id"), TG[TG.split == "test"].set_index("id")
+assert set(_tv.index) == set(val_df.id), "판정 목록의 검증 문항이 팀 공통 분할과 다릅니다 → 위 출력을 확인하세요"
+assert set(_tt.index) == set(test_df.id), "판정 목록의 test 문항이 test.csv와 다릅니다 → 위 출력을 확인하세요"
+assert TG.anchor.isin(list(LETTERS)).all() and TG.alt.isin(list(LETTERS)).all() and (TG[TG.target == 1].anchor != TG[TG.target == 1].alt).all(), "판정 목록의 답 글자 이상"
+ANCH_V, ANCH_T = _tv.anchor.to_dict(), _tt.anchor.to_dict()
+XV = val_df.merge(_tv[_tv.target == 1][["anchor", "alt", "n_alt"]].reset_index(), on="id")       # 검증 대상 (정답 있음 → 판정 모델 성적)
+XT = test_df.merge(_tt[_tt.target == 1][["anchor", "alt", "n_alt"]].reset_index(), on="id")
+_aw = int((_tv.loc[val_df.id].anchor.to_numpy() != val_df.answer.to_numpy()).sum())
+print(f"판정 목록 {TG_TAG} (기준 {XC_ANCHOR}) | 검증 대상 {len(XV)}/{len(val_df)} — 기준 오답 {int((XV.anchor != XV.answer).sum())}/{_aw} 포함, 대안이 정답 {int((XV.alt == XV.answer).sum())}"
+      f" | test 대상 {len(XT)}/{len(test_df)} | 표본 {K_SAMPLES}개씩 → 생성 {(len(XV) + len(XT)) * K_SAMPLES:,}개")

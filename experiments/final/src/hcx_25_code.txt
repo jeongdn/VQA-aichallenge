@@ -1,0 +1,11 @@
+if MAKE_SUBMISSION and not DRY_RUN:
+    test_preset = BEST_PRESET if TEST_PRESET == "auto" else TEST_PRESET
+    set_resolution(test_preset)
+    pred, _ = predict_df(test_df, f"{FINAL_TAG}_test", tta=TEST_TTA)
+    sub = sub_df[["id"]].merge(pred[["id", "pred"]], on="id", how="left").rename(columns={"pred": "answer"})
+    assert len(sub) == len(sub_df) and list(sub.id) == list(sub_df.id), "id 순서/개수 불일치"
+    assert sub.answer.notna().all(), f"예측 누락 {int(sub.answer.isna().sum())}건"
+    assert set(sub.answer.unique()) <= set(LETTERS), sub.answer.unique()
+    sp = os.path.join(RUN_DIR, f"submission_{RUN_NAME}_{FINAL_TAG}_{test_preset}{'_tta4' if TEST_TTA else ''}.csv"); sub.to_csv(sp, index=False)
+    print("저장:", sp, "| 예측 분포:", sub.answer.value_counts().sort_index().to_dict())
+    set_resolution(TRAIN_PRESET)

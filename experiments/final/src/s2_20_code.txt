@@ -1,0 +1,60 @@
+_STOP_AT = None      # (테스트용) 이 스텝에서 강제 중단
+quick_df = val_df.head(QUICK_EVAL_N if not DRY_RUN else 3 * BS)
+if SKIP_MISSING_IMAGES: quick_df = quick_df[quick_df.path.map(lambda p: os.path.exists(img_path(p)))]
+if DEVICE == "cuda": torch.cuda.reset_peak_memory_stats()
+model.train(); optimizer.zero_grad(set_to_none=True)
+t_start, run_loss, run_hit, n_micro = time.time(), 0.0, 0.0, 0
+step0 = state["global_step"]; plan_epoch = -1
+
+for step in range(step0, total_steps):
+    epoch, k = divmod(step, steps_per_epoch)
+    if epoch != plan_epoch: order, perms_all = epoch_plan(epoch); plan_epoch = epoch
+    idx = order[k * STEP_SAMPLES: (k + 1) * STEP_SAMPLES]
+    while True:                                        # OOM이면 마이크로 배치를 절반으로 줄여 같은 스텝을 다시 시도 (유효 배치는 그대로)
+        oom = False; s_loss, s_hit, s_n = 0.0, 0.0, 0
+        try:
+            for s in range(0, STEP_SAMPLES, MICRO_BS):
+                mb = idx[s: s + MICRO_BS]
+                if TRAIN_PRESETS: set_resolution(TRAIN_PRESETS[np.random.RandomState(TRAIN_SEED * 100003 + step * 97 + s).randint(len(TRAIN_PRESETS))])   # 결정적 → 재개해도 같음
+                loss, hit = train_micro_step([train_rows[i] for i in mb], [perms_all[i] for i in mb])
+                scaler.scale(loss / GRAD_ACCUM).backward()
+                s_loss += loss.item(); s_hit += hit; s_n += 1
+        except torch.cuda.OutOfMemoryError:
+            oom = True
+        if not oom: break
+        loss = None; optimizer.zero_grad(set_to_none=True); gc.collect(); torch.cuda.empty_cache()
+        if MICRO_BS == 1: raise RuntimeError("마이크로 배치 1에서도 GPU 메모리 부족 → TRAIN_PRESET을 낮추거나 4bit를 켜세요.")
+        MICRO_BS //= 2; GRAD_ACCUM *= 2
+        print(f"  ⚠️ OOM → MICRO_BS={MICRO_BS}, GRAD_ACCUM={GRAD_ACCUM} 로 바꿔 이 스텝을 다시 실행합니다", flush=True)
+    run_loss += s_loss; run_hit += s_hit; n_micro += s_n
+    if TRAIN_PRESETS: set_resolution(TRAIN_PRESET)
+    scaler.unscale_(optimizer)
+    gnorm = torch.nn.utils.clip_grad_norm_(params, 1.0)
+    scaler.step(optimizer); scaler.update(); scheduler.step(); optimizer.zero_grad(set_to_none=True)
+    state["global_step"] = step + 1
+
+    if (step + 1) % LOG_EVERY == 0 or step + 1 == total_steps or DRY_RUN:
+        el = time.time() - t_start; done = step + 1 - step0
+        print(f"step {step + 1:>4}/{total_steps} | ep {epoch + 1} | loss {run_loss / n_micro:.4f} | train_acc {run_hit / n_micro * 100:5.1f}% | "
+              f"lr {scheduler.get_last_lr()[0]:.2e} | gnorm {float(gnorm):.2f} | {el / done:.1f}s/step | 남은 시간 ~{(total_steps - step - 1) * el / done / 60:.0f}분", flush=True)
+        state["history"].append({"step": step + 1, "loss": run_loss / n_micro, "train_acc": run_hit / n_micro})
+        run_loss, run_hit, n_micro = 0.0, 0.0, 0
+    end_of_epoch = (step + 1) % steps_per_epoch == 0 or step + 1 == total_steps      # MAX_STEPS로 중간에 끝나는 경우도 'epoch 끝'으로 취급
+    if ((step + 1) % EVAL_EVERY == 0 and not end_of_epoch) or (DRY_RUN and step + 1 == total_steps):
+        acc, _ = evaluate(quick_df, f"quick_step{step + 1}", resume=False, verbose=False, by_type=False)
+        state["history"].append({"step": step + 1, "quick_val_acc": acc})
+    if end_of_epoch and not DRY_RUN:
+        acc, _ = evaluate(val_df, f"ep{epoch + 1}", resume=False, verbose=False)
+        state["epoch_acc"][epoch + 1] = acc
+        model.save_pretrained(os.path.join(RUN_DIR, f"adapter_ep{epoch + 1}"))
+    if (step + 1) % SAVE_EVERY == 0 or end_of_epoch or step + 1 == total_steps:
+        save_checkpoint()
+    if _STOP_AT and step + 1 == _STOP_AT: print("강제 중단(테스트)"); break
+
+if DEVICE == "cuda": print(f"최대 VRAM 사용: {torch.cuda.max_memory_allocated() / 2**30:.1f}GB / {VRAM_GB:.0f}GB")
+if DRY_RUN and total_steps > step0:
+    per_step = (time.time() - t_start) / (total_steps - step0)
+    full_steps = (len(train_df if TRAIN_ON_FULL else tr_df) // STEP_SAMPLES) * EPOCHS
+    print(f"\n✅ DRY RUN 통과. 본 학습 예상: {full_steps} 스텝 x {per_step:.1f}s ≈ {full_steps * per_step / 3600:.1f}시간 (+평가 약 15분). DRY_RUN=False로 바꿔 1번 셀부터 다시 실행하세요.")
+json.dump({"epoch_acc": state["epoch_acc"], "history": state["history"], "config": state["config"]},
+          open(os.path.join(RUN_DIR, "train_log.json"), "w"), indent=1, default=str)

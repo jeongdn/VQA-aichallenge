@@ -1,0 +1,20 @@
+import re, time
+from huggingface_hub import HfApi
+_fs = os.listdir(RUN_DIR)
+_val = sorted(f for f in _fs if re.match(r"^preds_final_ep\d+__.+__" + str(len(val_df)) + r"\.csv$", f))
+_tst = sorted(f for f in _fs if re.match(r"^preds_final_ep\d+_test__.+__" + str(len(test_df)) + r"\.csv$", f))
+assert _val and _tst, f"검증 1,000 · test 예측 파일이 없습니다 ({RUN_DIR}) → 11·12번 셀이 끝났는지 확인하세요"
+for f, n in [(x, len(val_df)) for x in _val] + [(x, len(test_df)) for x in _tst]:
+    _d = pd.read_csv(os.path.join(RUN_DIR, f))
+    assert _d.id.nunique() == n and _d[["p_a", "p_b", "p_c", "p_d"]].notna().all().all(), f"{f}: 문항 {_d.id.nunique()}/{n} 또는 확률 열 이상"
+api = HfApi(token=HF_TOKEN)
+api.create_repo(HF_REPO, repo_type="dataset", private=True, exist_ok=True)
+assert api.repo_info(HF_REPO, repo_type="dataset").private, f"{HF_REPO}가 공개 저장소입니다 → HF 웹에서 Private로 바꾼 뒤 다시 실행하세요"
+t0 = time.time(); _pre = f"vqa_runs/{RUN_NAME}"
+print(f"올리는 중: {RUN_DIR} → {HF_REPO}/{_pre}")
+api.upload_folder(repo_id=HF_REPO, repo_type="dataset", folder_path=RUN_DIR, path_in_repo=_pre, commit_message=f"RunPod xcheck {RUN_NAME}")
+_remote = set(api.list_repo_files(HF_REPO, repo_type="dataset"))
+_miss = [f for f in [f"{_pre}/{x}" for x in _val + _tst + ["train_log.json"]] if f not in _remote]
+assert not _miss, f"올라가지 않은 파일: {_miss}"
+print(f"✅ 올리기 완료 ({time.time() - t0:.0f}초) | {_val} · {_tst} · train_log.json")
+print("다음: ① 다른 판정 모델이면 MODEL_ID를 바꾸고 Kernel → Restart Kernel and Run All Cells ② 다 끝나면 Colab 브리지 노트북 B 단계 → anchor_rescue 다시 실행 → pod Terminate")

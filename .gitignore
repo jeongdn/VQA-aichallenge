@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 대회 데이터와 실행 결과 (공개 저장소에 올리지 않음)
+train/
+test/
+dev/
+vqa_runs/
+*.csv
+*.zip
+*.7z
+*.jsonl
