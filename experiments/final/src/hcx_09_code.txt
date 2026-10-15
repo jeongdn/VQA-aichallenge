@@ -1,0 +1,50 @@
+import re, json, time, math, hashlib, random, datetime, platform
+import numpy as np, pandas as pd, torch
+from PIL import Image, ImageOps
+Image.MAX_IMAGE_PIXELS = None
+
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+if torch.cuda.is_available(): torch.cuda.manual_seed_all(SEED)
+
+def _fix_nvrtc():
+    # 일부 Colab 이미지(새 CUDA)에서 GPU 정수 텐서의 prod가 런타임 컴파일(NVRTC) 도중 내장 라이브러리를 못 찾아 실패함.
+    # 1) 그 라이브러리를 경로로 직접 불러오고, 2) 그래도 안 되면 정수 prod만 CPU에서 계산하도록 우회 (결과는 완전히 같음)
+    if not torch.cuda.is_available(): return
+    import glob, ctypes
+    def _ok():
+        try: torch.tensor([[1, 2, 3]], device="cuda").prod(-1).item(); return True, ""
+        except RuntimeError as e: return False, str(e)
+    good, msg = _ok()
+    if good: return
+    need = re.findall(r"libnvrtc-builtins\.so[\d.]*", msg)
+    pats = ["/usr/local/lib/python3*/dist-packages/nvidia/**/libnvrtc-builtins.so*", "/usr/local/lib/python3*/site-packages/nvidia/**/libnvrtc-builtins.so*",
+            "/usr/local/cuda*/lib64/libnvrtc-builtins.so*", "/usr/lib/x86_64-linux-gnu/libnvrtc-builtins.so*"]
+    found = sorted({f for p in pats for f in glob.glob(p, recursive=True)})
+    for f in found:
+        if not need or any(os.path.basename(f).startswith(n) for n in need):
+            try: ctypes.CDLL(f, mode=ctypes.RTLD_GLOBAL)
+            except OSError: pass
+    if _ok()[0]: print("✅ NVRTC 내장 라이브러리를 직접 불러와 해결:", need); return
+    _orig_prod = torch.Tensor.prod
+    def _prod(self, *a, **k):
+        if self.is_cuda and not (self.is_floating_point() or self.is_complex()):
+            return _orig_prod(self.cpu(), *a, **k).to(self.device)
+        return _orig_prod(self, *a, **k)
+    torch.Tensor.prod = _prod
+    print("⚠️ GPU 정수 prod를 CPU에서 계산하도록 우회 (결과 동일) | 확인:", _ok()[0], "| 찾은 라이브러리:", found or "없음")
+_fix_nvrtc()
+
+train_df = pd.read_csv(os.path.join(DATA_DIR, "train.csv"))
+test_df  = pd.read_csv(os.path.join(DATA_DIR, "test.csv"))
+sub_df   = pd.read_csv(os.path.join(DATA_DIR, "sample_submission.csv"))
+dev_df   = pd.read_csv(os.path.join(DATA_DIR, "dev.csv")) if os.path.exists(os.path.join(DATA_DIR, "dev.csv")) else None
+for c in ["question", "a", "b", "c", "d"]:
+    train_df[c] = train_df[c].astype(str); test_df[c] = test_df[c].astype(str)
+train_df["answer"] = train_df["answer"].astype(str).str.strip().str.lower()
+assert set(train_df.answer.unique()) <= set("abcd"), train_df.answer.unique()
+assert list(test_df.id) == list(sub_df.id), "test.csv 와 sample_submission.csv 의 id 순서가 다릅니다"
+print(f"train {len(train_df):,} | test {len(test_df):,} | dev {0 if dev_df is None else len(dev_df):,}")
+print("정답 분포:", train_df.answer.value_counts().sort_index().to_dict())
+
+def img_path(rel):            # CSV의 path 컬럼은 DATA_DIR 기준 상대경로
+    return os.path.join(DATA_DIR, rel)

@@ -1,0 +1,9 @@
+import re
+# HyperCLOVA X 비전 V2는 transformers 정식 5.17에 없고 개발 버전(main)에만 있습니다 → 검증한 커밋으로 고정해 설치 (1~2분)
+!pip -q install "transformers @ git+https://github.com/huggingface/transformers.git@98d39824ed30e684e5122d04a2d9564efffc4965" "accelerate==1.15.0" "bitsandbytes==0.50.2" "peft==0.21.0"
+# Colab에 기본 설치된 구버전 torchao가 있으면 peft 0.21이 LoRA를 붙이는 순간 ImportError를 냅니다. 이 프로젝트에서는 쓰지 않으므로 제거
+!pip -q uninstall -y torchao
+# Qwen3.5의 선형 어텐션용 고속 Triton 커널. 없으면 순수 PyTorch 대체 구현으로 돌아 학습 시 메모리 부족(OOM)이 나고 매우 느립니다.
+# (transformers가 import 시점에 이 패키지를 찾으므로, 이미 모델을 로드한 세션에서 설치했다면 '세션 다시 시작'이 필요합니다)
+if re.search(r"Qwen3\.[5-9]", MODEL_ID):      # Qwen3.5 / 3.6 / 3.8 — 모두 같은 선형 어텐션 구조(model_type qwen3_5)
+    !pip -q install "flash-linear-attention==0.5.2"

@@ -1,0 +1,131 @@
+IDENTITY = (0, 1, 2, 3)
+TTA_PERMS = [(0, 1, 2, 3), (1, 2, 3, 0), (2, 3, 0, 1), (3, 0, 1, 2)]
+
+def set_resolution(preset):
+    global RES_PRESET, PIXEL_KW, GEN_SCALE
+    RES_PRESET = preset
+    GEN_SCALE = 1.0
+    if FAMILY == "generic":
+        PIXEL_KW = {}                                  # 커스텀 프로세서: 기본 전처리. up 프리셋은 원본 이미지를 확대해서 넘김
+        GEN_SCALE = {"up1.5": 1.5, "up2.0": 2.0, "up2.5": 2.5}.get(preset, 1.0)
+    elif FAMILY == "gemma4":
+        PIXEL_KW = {"max_soft_tokens": int(RES_PRESETS_GEMMA4[preset])}
+    elif FAMILY == "internvl":
+        PIXEL_KW = {"crop_to_patches": True, "min_patches": 1, "max_patches": int(RES_PRESETS_INTERNVL[preset])}
+    else:
+        mn, mx = RES_PRESETS[preset]
+        PIXEL_KW = {"min_pixels": int(mn), "max_pixels": int(mx)}
+set_resolution(TRAIN_PRESET)
+
+def render(row, perm=IDENTITY):
+    return _fix_prompt(processor.apply_chat_template(build_messages(row, perm), tokenize=False, add_generation_prompt=True, **TEMPLATE_KW))
+
+from PIL import ImageEnhance
+_AUG_ON = False                                   # train_micro_step 안에서만 True
+AUG_RNG = np.random.RandomState(TRAIN_SEED + 12345)
+def augment_image(im, rng=None):
+    # 글자를 읽는 과제라 기하 변형(반전·회전·자르기)은 쓰지 않고, 촬영 조건에 해당하는 밝기·대비·채도·감마·JPEG 화질만 흔듦
+    rng = rng or AUG_RNG
+    im = ImageEnhance.Brightness(im).enhance(rng.uniform(0.8, 1.2))
+    im = ImageEnhance.Contrast(im).enhance(rng.uniform(0.8, 1.2))
+    im = ImageEnhance.Color(im).enhance(rng.uniform(0.9, 1.1))
+    g = rng.uniform(0.85, 1.18); im = im.point(lambda v, g=g: int(255 * (v / 255) ** g))
+    if rng.rand() < 0.5:
+        import io; buf = io.BytesIO(); im.save(buf, "JPEG", quality=int(rng.uniform(60, 95))); buf.seek(0); im = Image.open(buf).convert("RGB")
+    return im
+
+def encode_batch(rows, perms):
+    texts  = [render(r, p) for r, p in zip(rows, perms)]
+    images = [load_image(r["path"]) for r in rows]
+    if _AUG_ON and IMG_AUG: images = [augment_image(im) for im in images]
+    if FAMILY == "generic" and GEN_SCALE != 1.0:
+        images = [im.resize((round(im.width * GEN_SCALE), round(im.height * GEN_SCALE)), Image.BICUBIC) for im in images]
+    if FAMILY == "gemma4": images = [[im] for im in images]          # Gemma 프로세서는 샘플별 이미지 리스트를 받음
+    return processor(text=texts, images=images, padding=True, return_tensors="pt", **PIXEL_KW)
+
+def _last_logits(enc):
+    enc = enc.to(model.device)
+    with torch.autocast(device_type="cuda", dtype=DTYPE, enabled=(DEVICE == "cuda")):
+        try:    out = model(**enc, logits_to_keep=1, use_cache=False)
+        except TypeError: out = model(**enc)
+    return out.logits[:, -1, :].float()
+
+def unpermute(prob_slot, perms):
+    probs = np.zeros_like(prob_slot)
+    for i, p in enumerate(perms):
+        for k, j in enumerate(p): probs[i, j] = prob_slot[i, k]
+    return probs
+
+@torch.inference_mode()
+def score_rows(rows, perms=None):
+    global BS
+    perms = perms or [IDENTITY] * len(rows)
+    enc = logits = None; oom = False
+    try:
+        enc = encode_batch(rows, perms)
+        n_img_tok = (enc["input_ids"] == IMAGE_TOKEN_ID).sum(dim=1).tolist()
+        logits = _last_logits(enc)
+        if not torch.isfinite(logits).all(): raise FloatingPointError("로짓에 NaN/Inf 발생")
+    except torch.cuda.OutOfMemoryError:
+        oom = True
+    if oom:
+        del enc, logits; torch.cuda.empty_cache()
+        if len(rows) == 1: raise RuntimeError("배치 1에서도 GPU 메모리 부족")
+        h = len(rows) // 2; BS = max(1, min(BS, h)); print(f"  ⚠️ OOM → 평가 배치를 {BS}(으)로 줄입니다")
+        p1, m1, t1 = score_rows(rows[:h], perms[:h]); p2, m2, t2 = score_rows(rows[h:], perms[h:])
+        return np.concatenate([p1, p2]), np.concatenate([m1, m2]), t1 + t2
+    logp = torch.log_softmax(logits, dim=-1)
+    slot = torch.stack([torch.logsumexp(logp[:, ids], dim=1) for ids in LETTER_IDS], dim=1)
+    mass = slot.exp().sum(dim=1).cpu().numpy()
+    return unpermute(torch.softmax(slot, dim=1).cpu().numpy().astype(np.float64), perms), mass, n_img_tok
+
+def score_rows_tta(rows, tta):
+    ps, ms, nt = [], [], None
+    for perm in (TTA_PERMS if tta else [IDENTITY]):
+        p, m, nt = score_rows(rows, [perm] * len(rows)); ps.append(p); ms.append(m)
+    return np.mean(ps, axis=0), np.mean(ms, axis=0), nt
+
+def predict_df(df, tag, tta=False, resume=True, verbose=True, save_every=25):
+    # df 전체를 채점. resume=True면 CSV에 이어 쓰며, 같은 tag로 다시 부르면 남은 문항만 처리
+    was_training = model.training; model.eval()
+    out_path = os.path.join(RUN_DIR, f"preds_{tag}__{RES_PRESET}{'__tta4' if tta else ''}__{len(df)}.csv")
+    done_ids = set(pd.read_csv(out_path).id) if (resume and os.path.exists(out_path)) else set()
+    if not resume and os.path.exists(out_path): os.remove(out_path)
+    todo = df[~df.id.isin(done_ids)]
+    if SKIP_MISSING_IMAGES: todo = todo[todo.path.map(lambda p: os.path.exists(img_path(p)))]
+    rows = todo.to_dict("records"); recs, t0, n_done, nb = [], time.time(), 0, 0
+    if verbose: print(f"[{os.path.basename(out_path)}] 전체 {len(df):,} | 완료 {len(done_ids):,} | 남음 {len(rows):,}")
+    while n_done < len(rows):
+        batch = rows[n_done: n_done + BS]
+        probs, mass, ntok = score_rows_tta(batch, tta)
+        for r, p, m, t in zip(batch, probs, mass, ntok):
+            recs.append({"id": r["id"], "pred": LETTERS[int(p.argmax())], "p_a": p[0], "p_b": p[1], "p_c": p[2], "p_d": p[3],
+                         "letter_mass": float(m), "img_tokens": int(t)})
+        n_done += len(batch); nb += 1
+        if nb % save_every == 0 or n_done >= len(rows):
+            pd.DataFrame(recs).to_csv(out_path, mode="a", header=not os.path.exists(out_path), index=False); recs = []
+            if verbose:
+                el = time.time() - t0
+                print(f"  {n_done:>5}/{len(rows)} | {el / n_done:.2f}s/문항 | 남은 시간 ~{(len(rows) - n_done) * el / n_done / 60:.0f}분", flush=True)
+    if was_training: model.train()
+    return pd.read_csv(out_path).drop_duplicates("id", keep="last"), out_path
+
+CATS = {"전화번호": r"전화|번호|연락처", "가격/금액": r"가격|얼마|금액|요금|할인", "이름/상호/제목": r"이름|상호|제목|브랜드|가게|매장|간판|업체",
+        "날짜/시간": r"날짜|언제|시간|기간|요일|몇 시|년도|연도", "위치/방향/층": r"어디|위치|방향|몇 층|층에|왼쪽|오른쪽|위쪽|아래",
+        "개수/숫자": r"몇 개|몇 명|몇 번|개수|몇 가지|숫자", "색상": r"색|컬러", "부정형": r"아닌|않는|없는|틀린|잘못"}
+
+def evaluate(df, tag, tta=False, resume=True, verbose=True, by_type=True):
+    pred, _ = predict_df(df, tag, tta=tta, resume=resume, verbose=verbose)
+    m = df.merge(pred, on="id", how="inner"); m["correct"] = (m.pred == m.answer)
+    acc = float(m.correct.mean()); n = len(m); se = math.sqrt(max(acc * (1 - acc), 1e-9) / n)
+    print(f"▶ {tag} | {RES_PRESET}{' +TTA4' if tta else ''} | 정확도 {acc * 100:.2f}% (n={n}, ±{1.96 * se * 100:.1f}%p) | letter_mass {m.letter_mass.mean():.3f}")
+    if by_type:
+        for k, pat in CATS.items():
+            sel = m.question.str.contains(pat)
+            if sel.sum() >= 10: print(f"    {k:<12} {m.correct[sel].mean() * 100:5.1f}%  (n={int(sel.sum())})")
+    lp = os.path.join(OUT_DIR, "results_log_s2.csv")
+    log = {"time": datetime.datetime.now().strftime("%m-%d %H:%M"), "run": f"{RUN_NAME}{'_dry' if DRY_RUN else ''}/{tag}", "model": str(MODEL_ID),
+           "res": RES_PRESET, "tta": int(tta), "n": n, "acc": round(acc * 100, 2), "ci95": round(1.96 * se * 100, 2),
+           "letter_mass": round(float(m.letter_mass.mean()), 3), "gpu": GPU_NAME, "split_md5": split_md5[:8]}
+    pd.DataFrame([log]).to_csv(lp, mode="a", header=not os.path.exists(lp), index=False)
+    return acc, m

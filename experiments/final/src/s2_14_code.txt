@@ -1,0 +1,99 @@
+import torch.nn.functional as F
+from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig, get_cosine_schedule_with_warmup
+from peft import LoraConfig, get_peft_model, PeftModel, set_peft_model_state_dict, load_peft_weights, prepare_model_for_kbit_training
+import transformers, peft
+print("transformers", transformers.__version__, "| peft", peft.__version__, "| torch", torch.__version__)
+
+import gc
+for _v in ("model", "base", "optimizer", "scheduler", "params", "loss", "enc", "logits", "out", "gnorm"):   # 이전 모델·중단된 학습의 그래프가 GPU에 남아 OOM 나는 것 방지
+    if _v in globals(): del globals()[_v]
+gc.collect()
+if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+if DEVICE == "cuda":
+    GPU_NAME = torch.cuda.get_device_name(0); cap = torch.cuda.get_device_capability(0)
+    BF16_NATIVE = cap[0] >= 8
+    VRAM_GB = torch.cuda.get_device_properties(0).total_memory / 2**30
+else:
+    GPU_NAME, BF16_NATIVE, VRAM_GB = "cpu", False, 0.0
+if DEVICE == "cpu":   DTYPE, use_4bit = torch.float32, False
+elif BF16_NATIVE:
+    _big = re.search(r"(?<![\d.])(2\d|3\d|7\d)B", str(MODEL_ID)) is not None
+    DTYPE, use_4bit = torch.bfloat16, (USE_4BIT is True or (USE_4BIT == "auto" and (VRAM_GB < 30 or _big)))
+else:                 DTYPE, use_4bit = torch.float16, (USE_4BIT is not False)
+USE_FP16_SCALER = (DEVICE == "cuda" and not BF16_NATIVE)
+BS = (8 if VRAM_GB >= 38 else 4 if VRAM_GB >= 20 else 2) if BATCH_SIZE == "auto" else int(BATCH_SIZE)
+print(f"GPU: {GPU_NAME} ({VRAM_GB:.0f}GB) | dtype={DTYPE} | 4bit={use_4bit} | 평가 배치={BS} | 학습 배치={MICRO_BS}x{GRAD_ACCUM}")
+
+import shutil
+RUN_DIR = os.path.join(OUT_DIR, RUN_NAME + ("_dry" if DRY_RUN else ""))
+CKPT_DIR = os.path.join(RUN_DIR, "ckpt_last")
+if DRY_RUN and os.path.exists(RUN_DIR): shutil.rmtree(RUN_DIR)          # 점검용 실행은 항상 처음부터
+os.makedirs(RUN_DIR, exist_ok=True)
+if not os.path.exists(CKPT_DIR) and os.path.exists(os.path.join(CKPT_DIR + "_tmp", "trainer_state.pt")):
+    os.replace(CKPT_DIR + "_tmp", CKPT_DIR)                              # 저장 직후 교체 단계에서 끊긴 경우 복구
+
+load_kw = dict(dtype=DTYPE, attn_implementation="sdpa")
+if DEVICE == "cuda": load_kw["device_map"] = {"": 0}
+if use_4bit:
+    load_kw["quantization_config"] = BitsAndBytesConfig(
+        load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=DTYPE,
+        llm_int8_skip_modules=["lm_head", ".*visual.*", ".*vision_tower.*", ".*vision_model.*", ".*multi_modal_projector.*", ".*embed_vision.*", ".*audio_tower.*", ".*embed_audio.*"])
+
+processor = AutoProcessor.from_pretrained(MODEL_ID)
+processor.tokenizer.padding_side = "left"
+tok = processor.tokenizer
+FAMILY = "gemma4" if type(processor).__name__.startswith("Gemma4") else "qwen"     # 프로세서 계열 (해상도 인자·이미지 전달 방식이 다름)
+IMAGE_TOKEN_ID = getattr(processor, "image_token_id", None)
+if IMAGE_TOKEN_ID is None: IMAGE_TOKEN_ID = tok.convert_tokens_to_ids(getattr(processor, "image_token", "<|image_pad|>"))
+_tmpl = processor.chat_template if isinstance(processor.chat_template, str) else json.dumps(processor.chat_template)
+TEMPLATE_KW = {"enable_thinking": False} if "enable_thinking" in (_tmpl or "") else {}
+try:
+    processor.apply_chat_template(build_messages({"question": "q", "a": "1", "b": "2", "c": "3", "d": "4"}), tokenize=False, add_generation_prompt=True, **TEMPLATE_KW); USE_SYSTEM_ROLE = True
+except Exception as _e:
+    USE_SYSTEM_ROLE = False; print("system 역할 미지원 템플릿 → 지시문을 user 메시지 앞에 붙입니다")
+print(f"계열: {FAMILY} | 이미지 토큰 id: {IMAGE_TOKEN_ID} | chat template 추가 인자: {TEMPLATE_KW} | system 역할: {USE_SYSTEM_ROLE}")
+t0 = time.time()
+base = AutoModelForImageTextToText.from_pretrained(MODEL_ID, **load_kw)
+base.config.use_cache = False
+if use_4bit and not BF16_NATIVE:
+    base = prepare_model_for_kbit_training(base, use_gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False})
+else:
+    base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+print(f"모델 로드 {time.time() - t0:.0f}s | {type(base).__name__}")
+
+LORA_TARGETS = r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|in_proj_qkv|in_proj_z|out_proj)"
+RESUMING = os.path.exists(os.path.join(CKPT_DIR, "trainer_state.pt"))
+if RESUMING:
+    model = PeftModel.from_pretrained(base, os.path.join(CKPT_DIR, "adapter"), is_trainable=True)
+    print("↩️ 체크포인트에서 어댑터를 불러왔습니다:", CKPT_DIR)
+else:
+    torch.manual_seed(TRAIN_SEED)                                        # LoRA 초기화 시드
+    model = get_peft_model(base, LoraConfig(r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT, bias="none",
+                                            target_modules=LORA_TARGETS))
+# PEFT는 체크포인팅이 켜져 있으면 '입력 임베딩 출력에 grad 요구' 훅을 거는데, transformers 5.x에서는 이 훅이 비전 타워에도 걸려
+# 얼려 둔 비전 타워 전체가 역전파 그래프에 들어갑니다(메모리·시간 낭비). 비재진입(non-reentrant) 체크포인팅에서는 필요 없으므로 제거합니다.
+if hasattr(base, "disable_input_require_grads") and getattr(base, "_require_grads_hooks", None):
+    base.disable_input_require_grads(); print("입력-grad 훅 제거 (비전 타워는 역전파에서 제외)")
+if "qwen3_5" in str(getattr(base.config, "model_type", "")):
+    import importlib.util
+    if importlib.util.find_spec("fla") is None:
+        print("⚠️⚠️ flash-linear-attention이 없습니다 → 선형 어텐션이 순수 PyTorch로 돌아 OOM/저속 위험. 2번 셀을 실행하고 '세션 다시 시작' 후 처음부터 실행하세요.")
+    else:
+        print("✅ flash-linear-attention 커널 사용")
+model.print_trainable_parameters()
+n_lora = sum(1 for n, _ in model.named_modules() if n.endswith("lora_A"))
+n_lora_vis = sum(1 for n, _ in model.named_modules() if n.endswith("lora_A") and any(k in n for k in ("visual", "vision_tower", "vision_model")))
+print(f"LoRA가 붙은 층: {n_lora}개 (비전 타워 {n_lora_vis}개 — 0이어야 정상)")
+assert n_lora > 0 and n_lora_vis == 0
+
+LETTER_IDS = []                                     # 첫 번째(소문자·공백 없음)가 학습 목표, 나머지 변형은 확률 집계용
+for L in LETTERS:
+    ids = []
+    for s in (L, L.upper(), " " + L, " " + L.upper()):
+        t = tok.encode(s, add_special_tokens=False)
+        if len(t) == 1 and t[0] not in ids: ids.append(t[0])
+    assert ids and len(tok.encode(L, add_special_tokens=False)) == 1, f"'{L}' 가 단일 토큰이 아닙니다"
+    LETTER_IDS.append(ids)
+print("글자 토큰 id:", dict(zip(LETTERS, LETTER_IDS)))

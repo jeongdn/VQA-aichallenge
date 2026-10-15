@@ -1,0 +1,107 @@
+PROMPT_VERSION = "baseline_v1"
+SYSTEM_INSTRUCT = ("You are a helpful visual question answering assistant. "
+                   "Answer using exactly one letter among a, b, c, or d. No explanation.")
+LETTERS = "abcd"
+
+def build_mc_prompt(question, options):
+    a, b, c, d = options
+    return (f"{question}\n(a) {a}\n(b) {b}\n(c) {c}\n(d) {d}\n\n"
+            "정답을 반드시 a, b, c, d 중 하나의 소문자 한 글자로만 출력하세요.")
+
+def build_messages(row, perm=(0, 1, 2, 3)):
+    # perm[k] = 화면의 k번째 자리에 놓을 '원래 선지'의 인덱스
+    opts = [str(row[LETTERS[j]]) for j in perm]
+    user_text = build_mc_prompt(str(row["question"]), opts)
+    if globals().get("USE_SYSTEM_ROLE", True):
+        return [{"role": "system", "content": [{"type": "text", "text": SYSTEM_INSTRUCT}]},
+                {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": user_text}]}]
+    # system 역할이 없는 템플릿(일부 Gemma 등): 지시문을 user 메시지 앞에 붙임
+    return [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": SYSTEM_INSTRUCT + "\n\n" + user_text}]}]
+
+def load_image(rel):
+    im = Image.open(img_path(rel))
+    im = ImageOps.exif_transpose(im)      # 촬영 방향(EXIF) 보정 — 없으면 그대로
+    return im.convert("RGB")
+if PROMPT_VERSION_USE == "ko_v1":
+    PROMPT_VERSION = "ko_v1"
+    SYSTEM_INSTRUCT = "당신은 이미지를 보고 객관식 질문에 답하는 도우미입니다. a, b, c, d 중 정확히 한 글자로만 답하고 설명하지 마세요."
+assert PROMPT_VERSION == PROMPT_VERSION_USE, (PROMPT_VERSION, PROMPT_VERSION_USE)
+
+from transformers import AutoProcessor
+import transformers
+processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=TRUST_REMOTE_CODE)
+tok = getattr(processor, "tokenizer", processor)
+_tmpl = getattr(processor, "chat_template", None) or getattr(tok, "chat_template", None)
+_tmpl = _tmpl if isinstance(_tmpl, str) else json.dumps(_tmpl)
+TEMPLATE_KW = {"enable_thinking": False} if "enable_thinking" in (_tmpl or "") else {}
+_apply = processor.apply_chat_template if hasattr(processor, "apply_chat_template") and getattr(processor, "chat_template", None) else tok.apply_chat_template
+try:
+    _apply(build_messages({"question": "q", "a": "1", "b": "2", "c": "3", "d": "4"}), tokenize=False, add_generation_prompt=True, **TEMPLATE_KW); USE_SYSTEM_ROLE = True
+except Exception as _e:
+    USE_SYSTEM_ROLE = False; print("system 역할 미지원 템플릿 → 지시문을 user 메시지 앞에 붙입니다")
+IMAGE_TOKEN = getattr(processor, "image_token", None)
+IMAGE_TOKEN_ID = getattr(processor, "image_token_id", None)
+if IMAGE_TOKEN_ID is None and IMAGE_TOKEN: IMAGE_TOKEN_ID = tok.convert_tokens_to_ids(IMAGE_TOKEN)
+PROC_NAME = type(processor).__name__
+FAMILY = "gemma4" if PROC_NAME.startswith("Gemma4") else ("qwen" if "Qwen" in PROC_NAME or hasattr(getattr(processor, "image_processor", None), "merge_size") else "other")
+
+def render(row):
+    return _apply(build_messages(row), tokenize=False, add_generation_prompt=True, **TEMPLATE_KW) + ANSWER_PREFIX
+
+_p = render(VAL_USE.iloc[0].to_dict())
+if IMAGE_TOKEN and _p.count(IMAGE_TOKEN) != 1:
+    print(f"ℹ️ 렌더링한 프롬프트에 이미지 토큰 {IMAGE_TOKEN!r}가 {_p.count(IMAGE_TOKEN)}번 보입니다 (템플릿이 다른 자리표시를 씀 → vLLM이 처리. 첫 묶음 점검에서 확인)")
+print(f"transformers {transformers.__version__} | {PROC_NAME} (계열 {FAMILY}) | 템플릿 추가 인자 {TEMPLATE_KW} | system 역할 {USE_SYSTEM_ROLE} | 이미지 토큰 {IMAGE_TOKEN}={IMAGE_TOKEN_ID}")
+print("프롬프트 끝부분:", repr(_p[-160:]))
+
+LETTER_IDS = []                                     # 첫 번째(소문자·공백 없음)가 학습 목표, 나머지 변형은 확률 집계용
+for L in LETTERS:
+    ids = []
+    for s in (L, L.upper(), " " + L, " " + L.upper()):
+        t = tok.encode(s, add_special_tokens=False)
+        if len(t) == 1 and t[0] not in ids: ids.append(t[0])
+    assert ids and len(tok.encode(L, add_special_tokens=False)) == 1, f"'{L}' 가 단일 토큰이 아닙니다"
+    LETTER_IDS.append(ids)
+print("글자 토큰 id:", dict(zip(LETTERS, LETTER_IDS)))
+
+# ── 교차 검증 프롬프트 (E20과 같은 문구, 결과를 보기 전에 고정) ──
+XC_TEMPLATE_KW = {"enable_thinking": bool(THINKING)} if "enable_thinking" in (_tmpl or "") else {}
+XC_SYSTEM = "당신은 이미지 속 글자와 내용을 꼼꼼히 확인해 객관식 문제의 정답을 판정하는 검증자입니다."
+def xc_user_text(row, A, B):
+    opts = "\n".join(f"({L}) {row[L]}" for L in LETTERS)
+    return (f"{row['question']}\n{opts}\n\n"
+            "[작전 지시: 오답 돌파 프로토콜]\n"
+            "1. 두 모델의 판단이 갈렸다.\n"
+            f"   - 모델 A의 답: ({LETTERS[A]}) {row[LETTERS[A]]}\n"
+            f"   - 모델 B의 답: ({LETTERS[B]}) {row[LETTERS[B]]}\n"
+            "2. 이미지에서 질문과 관련된 부분을 찾아 글자와 숫자를 정확히 읽고, 각 모델이 전제로 삼은 근거에서 논리적 모순이나 비약이 있는지 교차 검증하라.\n"
+            "3. 이 문제 유형에서 자주 발생하는 대표적 착각 패턴을 배제하고, 최종 결론을 단계별로 도출하라.\n"
+            "마지막 줄에는 반드시 \"정답: (a)\"처럼 a, b, c, d 중 하나만 적어라.")
+def xc_messages(row, A, B):
+    t = xc_user_text(row, A, B)
+    if USE_SYSTEM_ROLE:
+        return [{"role": "system", "content": [{"type": "text", "text": XC_SYSTEM}]},
+                {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": t}]}]
+    return [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": XC_SYSTEM + "\n\n" + t}]}]
+def xc_pair(qid, anchor, alt):
+    # 기준 답·대안을 모델 A/B 자리에 무작위로 (문항 id로 고정 → 다시 돌려도 같음, 판정 모델이 어느 쪽이 기준인지 모름)
+    flip = int(hashlib.md5(f"{qid}|xc".encode()).hexdigest(), 16) % 2
+    return (alt, anchor) if flip else (anchor, alt)
+def render_xc(row, A, B):
+    return _apply(xc_messages(row, A, B), tokenize=False, add_generation_prompt=True, **XC_TEMPLATE_KW)
+# 마지막 '정답: (x)'를 읽음. 괄호 없는 대문자 A·B는 '모델 A/B'와 헷갈려서 답으로 치지 않음
+_ANS_RE = re.compile(r"정답\s*[:：]?\s*\**\s*[\(\[（]\s*([abcdABCD])\s*[\)\]）]|정답\s*[:：]\s*\**\s*([abcdCD])(?![A-Za-z가-힣])")
+def parse_answer(text):
+    t = text.split("</think>")[-1]                         # 생각 모드면 생각 뒤 부분만
+    m = list(_ANS_RE.finditer(t))
+    if m: return (m[-1].group(1) or m[-1].group(2)).lower()
+    tail = t.strip().splitlines()[-1] if t.strip() else ""
+    m2 = re.findall(r"\(([abcd])\)", tail)
+    return m2[-1] if m2 else None
+for _s, _e in [("분석 끝.\n정답: (c)", "c"), ("정답은 (a)일 수도 있지만 ... \n정답: b", "b"), ("최종 정답：（d）", "d"), ("답을 모르겠다", None),
+               ("<think>정답: (a)</think>\n정답: (c)", "c"), ("**정답: (b)**", "b"), ("정답: 모델 A", None), ("정답: B", None), ("정답: d", "d")]:
+    assert parse_answer(_s) == _e, (_s, parse_answer(_s))
+_r0 = VAL_USE.iloc[0].to_dict(); _A0, _B0 = xc_pair(_r0["id"], 0, 1)
+_px = render_xc(_r0, _A0, _B0)
+if IMAGE_TOKEN and _px.count(IMAGE_TOKEN) != 1: print(f"ℹ️ 판정 프롬프트에 이미지 토큰 {IMAGE_TOKEN!r}가 {_px.count(IMAGE_TOKEN)}번 보입니다 (첫 묶음 점검에서 확인)")
+print(f"판정 템플릿 추가 인자 {XC_TEMPLATE_KW} | 예시 끝부분:"); print(_px[-600:])

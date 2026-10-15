@@ -1,0 +1,3 @@
+# 실제 vLLM의 Qwen3.5 모델 모듈처럼 멀티모달 처리(parse → audio → torchaudio 시도)를 가져옴
+import vllm.multimodal.parse  # noqa: F401
+class Qwen3_5MoeForConditionalGeneration: ...

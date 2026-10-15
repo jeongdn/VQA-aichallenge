@@ -1,0 +1,49 @@
+# ── E8: RECIPE_FROM 멤버의 학습 설정을 그대로 가져와 '전체 데이터(검증 포함)'로 학습 ──
+# HCX 노트북에 붙여 넣을 때도 이 셀 그대로: Drive 연결 셀 다음, 모델 로드 셀 전에 실행
+import os, json
+RECIPE_FROM = globals().get("RECIPE_FROM") or "hcx32b_r16_native"
+_lp = os.path.join(OUT_DIR, RECIPE_FROM, "train_log.json")
+assert os.path.exists(_lp), f"{_lp} 가 없습니다 → RECIPE_FROM(기존 멤버 폴더 이름)을 확인하세요"
+_log = json.load(open(_lp, encoding="utf-8"))
+_cfg = dict(_log.get("config") or {})
+assert _cfg, f"{_lp}에 학습 설정(config)이 없습니다 → 위 출력을 확인하세요"
+assert not _cfg.get("TRAIN_ON_FULL"), f"{RECIPE_FROM}은 이미 전체 데이터로 학습한 실행입니다 → 검증셋을 뺀 원래 멤버 이름을 넣으세요"
+_DEF = {"TRAIN_SEED": 42, "MAX_STEPS": None, "EXTRA_TRAIN_CSV": None, "IMG_AUG": False, "TRAIN_PRESETS": None}   # 예전 기록에 없는 항목의 기본값 (stage2 이어하기 규칙과 같음)
+_COPY = ["MODEL_ID", "TRAIN_PRESET", "EPOCHS", "MAX_STEPS", "LR", "LORA_R", "LORA_ALPHA", "SHUFFLE_OPTIONS", "SEED", "TRAIN_SEED",
+         "EXTRA_TRAIN_CSV", "IMG_AUG", "TRAIN_PRESETS"]
+_missing = [k for k in _COPY if k not in _cfg and k not in _DEF]
+assert not _missing, f"train_log.json의 config에 {_missing}이 없습니다 → 위 출력을 확인하세요"
+for _k in _COPY: globals()[_k] = _cfg.get(_k, _DEF.get(_k))
+assert SEED == 42, f"검증 분할 시드가 팀 공통값(42)이 아닙니다: {SEED}"
+if globals().get("E8_STAGE2_NB") and ("hyperclova" in str(MODEL_ID).lower() or "hcx" in RECIPE_FROM.lower()):
+    raise RuntimeError("HCX는 이 노트북이 아니라 HCX 학습 노트북에 이 셀을 붙여 넣어 쓰세요 (설치·모델 로드가 다름)")
+_ea = {int(k): v for k, v in (_log.get("epoch_acc") or {}).items()}
+_best = max(_ea, key=lambda e: (_ea[e], e)) if _ea else None
+if _best is not None and _best != int(EPOCHS):
+    raise RuntimeError(f"{RECIPE_FROM}은 EPOCHS={EPOCHS}로 학습하고 검증으로 epoch {_best}를 골랐습니다. 전체 데이터에서는 검증으로 epoch를 "
+                       "고를 수 없어 멈춥니다 → 위 출력을 확인하세요")
+if MAX_STEPS:
+    _old = int(MAX_STEPS); MAX_STEPS = int(round(_old * 6714 / 5714))
+    print(f"⚠️ 원래 실행은 MAX_STEPS={_old}에서 끊었습니다 → 데이터가 늘어난 비율(6,714/5,714)만큼 {MAX_STEPS}로 늘립니다")
+if EXTRA_TRAIN_CSV:
+    assert os.path.exists(EXTRA_TRAIN_CSV), f"추가 학습 데이터(EXTRA_TRAIN_CSV)가 없습니다: {EXTRA_TRAIN_CSV}"
+_ss = int(_cfg.get("STEP_SAMPLES", MICRO_BS * GRAD_ACCUM))
+if globals().get("E8_STAGE2_NB"):                  # 원래 노트북 기본값: Qwen native 2×8, Gemma up2.0 1×16 (유효 배치는 기록값 그대로)
+    MICRO_BS = 2 if (str(TRAIN_PRESET) == "native" and not TRAIN_PRESETS) else 1
+if MICRO_BS * GRAD_ACCUM != _ss:
+    assert _ss % MICRO_BS == 0, f"유효 배치 {_ss}를 MICRO_BS={MICRO_BS}로 나눌 수 없습니다"
+    GRAD_ACCUM = _ss // MICRO_BS
+TRAIN_ON_FULL = True
+RUN_NAME = RECIPE_FROM + "_full"
+if "RUN_DIR" in globals() and os.path.basename(str(RUN_DIR)).replace("_dry", "") != RUN_NAME:
+    raise RuntimeError(f"결과 폴더(RUN_DIR={RUN_DIR})가 이미 정해졌습니다 → 이 셀을 모델 로드 셀보다 앞에 두고 1번 셀부터 다시 실행하세요 (원래 멤버 폴더를 덮어쓰지 않도록 멈춤)")
+RES_PRESET = TRAIN_PRESET
+MAKE_SUBMISSION, TEST_PRESET, TEST_TTA = True, "up2.0", False
+EVAL_PRESETS, EVAL_TTA = ["up2.0"], False        # 검증 점수는 의미 없음(학습에 포함) — 학습 확인·파일 위치용
+print(f"따라 할 멤버: {RECIPE_FROM} (검증으로 고른 epoch {_best}) → 새 실행 폴더: {RUN_NAME}{'_dry' if DRY_RUN else ''}")
+for _k in _COPY: print(f"  {_k:<16} = {globals()[_k]!r}" + ("" if _k in _cfg else "  (기록 없음 → 기본값)"))
+print(f"  유효 배치         = {MICRO_BS} × {GRAD_ACCUM} = {MICRO_BS * GRAD_ACCUM} (기록 {_ss}) | TRAIN_ON_FULL=True | 끝나면 test 추론 {TEST_PRESET}")
+print("  정밀도: bf16 (이 노트북 고정)" if globals().get("E8_STAGE2_NB") else "  ⚠️ 정밀도(USE_4BIT)는 기록에 없습니다 → 설정 셀의 USE_4BIT이 원래 실행과 같은지 확인하세요")
+_prev = os.path.join(OUT_DIR, RUN_NAME)
+if os.path.isdir(_prev) and any(f.startswith("preds_final_") and "_test__" in f for f in os.listdir(_prev)):
+    print(f"ℹ️ {RUN_NAME}에는 이미 test 예측이 있습니다 (끝난 실행). 다시 돌릴 필요가 없습니다.")

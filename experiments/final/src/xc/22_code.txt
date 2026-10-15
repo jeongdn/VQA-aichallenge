@@ -1,0 +1,19 @@
+GEN_V = generate_xc(XV, GEN_VAL, "val"); CNT_V = counts_of(GEN_V, XV)
+GEN_T = generate_xc(XT, GEN_TEST, "test"); CNT_T = counts_of(GEN_T, XT)
+_rows = []
+for r, A, B in _items(XV):
+    c = CNT_V.get(r["id"]); v = decide(c)
+    _rows.append({"id": r["id"], "정답": r["answer"], "기준": r["anchor"], "대안": r["alt"], "판정": LETTERS[v] if v is not None else "기권",
+                  "A자리": LETTERS[A], "B자리": LETTERS[B], "투표": " ".join(f"{L}{int(c[k])}" for k, L in enumerate(LETTERS) if c[k] > 0) if c is not None else "", "대안 표": r["n_alt"],
+                  "질문": str(r["question"])[:34]})
+JV = pd.DataFrame(_rows, columns=["id", "정답", "기준", "대안", "판정", "A자리", "B자리", "투표", "대안 표", "질문"]); dec = JV[JV.판정 != "기권"]
+_g = pd.concat([GEN_V, GEN_T]) if len(GEN_T) else GEN_V
+say(f"[판정 {MODEL_ID}] 검증 대상 {len(JV)} | 판정 {len(dec)} (기권 {len(JV) - len(dec)}) | 판정 정답 {int((dec.판정 == dec.정답).sum())} vs 같은 문항 기준 정답 {int((dec.기준 == dec.정답).sum())}"
+    f" | 판정 = 기준 {int((dec.판정 == dec.기준).sum())} · = 대안 {int((dec.판정 == dec.대안).sum())} · 그 밖 {int(((dec.판정 != dec.기준) & (dec.판정 != dec.대안)).sum())}")
+_ch = dec[dec.판정 != dec.기준]
+say(f"  기준과 다른 답 {len(_ch)}문항: 맞게 바꿈 {int((_ch.판정 == _ch.정답).sum())} · 기준이 맞았는데 바꿈 {int((_ch.기준 == _ch.정답).sum())} (이 모델 혼자 기준. 실제로 뒤집을지는 anchor_rescue가 정함)")
+say(f"  표본 {len(_g)}개: 답 읽음 {int(_g.letter.notna().sum())} ({_g.letter.notna().mean() * 100:.1f}%) · 길이 제한 {int((_g.finish == 'length').sum())} · 평균 {_g.ntok.mean():.0f}토큰"
+    f" | 판정이 A 자리 보기 {int((dec.판정 == dec.A자리).sum())} · B 자리 {int((dec.판정 == dec.B자리).sum())} · 둘 다 아님 {int(((dec.판정 != dec.A자리) & (dec.판정 != dec.B자리)).sum())} (A·B가 한쪽으로 크게 쏠리면 자리 편향)")
+if len(_ch): print("\n기준과 다른 답을 고른 검증 문항:"); print(_ch.drop(columns=["A자리", "B자리"]).to_string(index=False))
+_dt = [decide(CNT_T.get(i)) for i in XT.id]
+say(f"  test 대상 {len(XT)} | 판정 {sum(v is not None for v in _dt)} · 기준과 다른 답 {sum(v is not None and LETTERS[v] != a for v, a in zip(_dt, XT.anchor))}")

@@ -1,0 +1,2 @@
+## 9. vLLM으로 모델 로드
+오류가 나면 마지막 20줄을 확인하세요. 설정을 바꾼 뒤에는 **Kernel → Restart Kernel and Run All Cells**로 다시 시작하세요.

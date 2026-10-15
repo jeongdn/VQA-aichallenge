@@ -1,0 +1,16 @@
+if PRESET == "default" or FAMILY == "other":
+    MM_KW = {}
+elif FAMILY == "gemma4":
+    MM_KW = {"max_soft_tokens": int(RES_PRESETS_GEMMA4[PRESET])}
+else:
+    MM_KW = {"min_pixels": int(RES_PRESETS[PRESET][0]), "max_pixels": int(RES_PRESETS[PRESET][1])}
+if FAMILY == "other" and PRESET != "default":
+    print(f"ℹ️ {PROC_NAME}은 해상도 인자를 모르는 계열이라 모델 기본 처리로 둡니다 (PRESET={PRESET!r}는 이름에만 남음)")
+for _r in VAL_USE.head(2).to_dict("records"):
+    _im = load_image(_r["path"])
+    try:
+        _enc = processor(text=[render(_r)], images=[[_im]] if FAMILY == "gemma4" else [_im], return_tensors="pt", **MM_KW)
+        _n = int((_enc["input_ids"] == IMAGE_TOKEN_ID).sum()) if IMAGE_TOKEN_ID is not None else -1
+        print(f"  {_r['id']}: 원본 {_im.size} → 프롬프트 {int(_enc['input_ids'].shape[1])}토큰 (이미지 토큰 {_n}) | 해상도 인자 {MM_KW or '기본'}")
+    except Exception as _e:
+        print(f"  ⚠️ HF 프로세서 점검 실패 ({type(_e).__name__}: {str(_e)[:160]}) → vLLM 쪽 처리로 진행 (첫 묶음 점검에서 확인)")

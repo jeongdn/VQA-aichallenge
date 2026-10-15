@@ -1,0 +1,59 @@
+RUN_NAME   = "hcx32b_r16_native_full"        # 실험 이름 = 저장 폴더 이름. 설정을 바꾸면 이름도 바꾸세요
+MODEL_ID   = "naver-hyperclovax/HyperCLOVAX-SEED-Think-32B"   # NAVER. HyperCLOVA X 언어 모델 + Qwen2.5-VL 비전 인코더. transformers 개발 버전 필요(2번 셀이 설치)
+DRY_RUN    = False         # 본 학습 (제로샷·프롬프트 수정은 이전 세션에서 확인: 300문항 95.67%, letter_mass 1.000)
+
+# ── 학습 ──
+TRAIN_PRESET = "native"   # 픽셀 기준 해상도 (Qwen과 같은 방식)
+EPOCHS     = 1
+MAX_STEPS  = None          # 숫자를 넣으면 그 스텝에서 학습을 끝냄 (큰 모델을 짧게 학습할 때. 예: 200). None이면 EPOCHS만큼
+LR         = 1e-4
+MICRO_BS   = 2             # GPU에 한 번에 올리는 문항 수. 학습 중 OOM이 나면 자동으로 절반으로 줄이고 GRAD_ACCUM을 2배로 늘립니다
+GRAD_ACCUM = 8             # 유효 배치 = MICRO_BS x GRAD_ACCUM = 16 (이 곱이 같으면 학습 결과의 성격은 같습니다)
+LORA_R, LORA_ALPHA, LORA_DROPOUT = 16, 32, 0.05
+WARMUP_RATIO = 0.05
+SHUFFLE_OPTIONS = True     # 선지 셔플 증강
+TRAIN_ON_FULL = False      # True: 검증셋까지 합쳐 전체 6,714개로 학습 (레시피가 확정된 뒤 최종 제출용)
+LOG_EVERY, EVAL_EVERY, SAVE_EVERY = 10, 100, 50    # 옵티마이저 스텝 단위
+QUICK_EVAL_N = 300         # 학습 도중 빠른 점검용 검증 문항 수 (epoch 끝에는 1,000개 전체 평가)
+
+# ── 평가/제출 ──
+EVAL_PRESETS = ["up2.0"]
+EVAL_TTA     = False        # 가장 좋았던 해상도에서 선지 순열 4종 평균(TTA)의 효과도 측정
+MAKE_SUBMISSION = True      # 학습·검증 뒤 이어서 test 추론까지 (약 1~1.5시간 추가). 검증 결과를 보고 쓸지 정함
+TEST_PRESET  = "up2.0"
+TEST_TTA     = False       # True면 test 추론 시간이 4배. 검증에서 TTA 이득이 확인된 뒤 켜서 12번 셀만 다시 실행
+
+DRIVE_ZIP    = "/content/drive/MyDrive/ssafy-16-2-ai.zip"
+ZIP_PASSWORD = "YOUR_ZIP_PASSWORD"
+DATA_DIR     = "/content"
+OUT_DIR      = "/content/drive/MyDrive/vqa_runs"
+USE_4BIT   = "auto"        # "auto": VRAM 30GB 미만·bf16 미지원·20B 이상 모델이면 4bit(QLoRA), 그 외 A100은 bf16 LoRA
+BATCH_SIZE = "auto"        # 평가용 배치
+SEED, VAL_SIZE = 42, 1000  # 검증 분할용 — 팀 공통값이므로 절대 바꾸지 마세요
+TRAIN_SEED = 42            # 학습 순서·선지 셔플·LoRA 초기화 시드. 같은 레시피로 두 번째 모델을 만들 때(시드 앙상블) 43 등으로 변경
+TRAIN_LIMIT = None         # 디버그용: 학습 샘플 수 제한
+EXTRA_TRAIN_CSV = None     # 추가 학습 데이터 CSV 경로 (예: Stage 5가 만든 dev 의사 라벨). 열: id,path,question,a,b,c,d,answer. 검증 문항은 자동 차단
+IMG_AUG = False            # True: 학습 이미지에만 밝기·대비·채도·감마·JPEG 화질을 무작위로 흔듦 (글자·방향·위치는 그대로). 평가·test에는 적용 안 함
+TRAIN_PRESETS = None       # 예: ["native", "up1.5", "up2.0"] → 마이크로 배치마다 학습 해상도를 무작위로 고름(다해상도 학습). None이면 TRAIN_PRESET 고정
+AUX_GEN_CSV = None         # 문자열 보조학습 데이터(id,path,question,answer_text). 예: MTVQA 원본 질문→정답 문자열. None이면 끔
+AUX_GEN_EVERY = 5          # 객관식 마이크로 배치 N개마다 보조 마이크로 배치 1개 (5면 문항 비중 약 80:20)
+AUX_GEN_WEIGHT = 1.0       # 보조 손실(정답 문자열 토큰 평균 교차 엔트로피) 가중치
+AUX_MAX_ANS_TOKENS = 24    # 이보다 긴 정답 문자열은 보조학습에서 제외
+SKIP_MISSING_IMAGES = False
+HF_TOKEN   = ""            # Gemma처럼 라이선스 승인이 필요한 모델일 때 HF 토큰 (비워 두면 Colab 보안 비밀 'HF_TOKEN'을 찾아봄)
+
+RES_PRESETS = {
+    "baseline384": (384 * 384, 384 * 384),
+    "mid":         (256 * 28 * 28, 512 * 28 * 28),
+    "native":      (256 * 28 * 28, 1280 * 28 * 28),
+    "up1.5":       (1_550_000, 2_100_000),
+    "up2.0":       (2_700_000, 3_400_000),
+}
+# Gemma 4 계열은 이미지당 '소프트 토큰' 수(70/140/280/560/1120)로 해상도를 정합니다. 프리셋 이름은 그대로 쓰고 값만 대응 (280 ≈ 원본, 560 ≈ 1.3배, 1120 ≈ 1.9배)
+RES_PRESETS_GEMMA4 = {"baseline384": 70, "mid": 140, "native": 280, "up1.5": 560, "up2.0": 1120}
+# InternVL 계열은 448px 타일 개수(max_patches)로 해상도를 정합니다. 타일 1개 = 이미지 토큰 256개 (+ 전체 축소본 1타일). 720x960 사진 기준 up2.0(12타일)은 약 1.9배 확대
+RES_PRESETS_INTERNVL = {"baseline384": 1, "mid": 4, "native": 6, "up1.5": 9, "up2.0": 12, "up2.5": 16}
+ZEROSHOT_CHECK_N = 0       # 제로샷은 이미 측정함
+RES_PRESET = TRAIN_PRESET
+import os; os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")   # GPU 메모리 단편화 완화 (torch import 전에 설정)
+os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")   # 허깅페이스 고속 다운로드 (병렬 수신). HF_TOKEN 보안 비밀도 꼭 등록하세요

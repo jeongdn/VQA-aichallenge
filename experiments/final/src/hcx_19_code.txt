@@ -1,0 +1,127 @@
+train_src = train_df if TRAIN_ON_FULL else tr_df
+if SKIP_MISSING_IMAGES: train_src = train_src[train_src.path.map(lambda p: os.path.exists(img_path(p)))]
+if DRY_RUN:       train_src = train_src.head(3 * MICRO_BS * GRAD_ACCUM)
+elif TRAIN_LIMIT: train_src = train_src.head(int(TRAIN_LIMIT))
+if EXTRA_TRAIN_CSV:                                   # 추가 학습 데이터(예: dev 의사 라벨)는 위 제한과 별개로 뒤에 붙임
+    _need = ["id", "path", "question", "a", "b", "c", "d", "answer"]
+    extra = pd.read_csv(EXTRA_TRAIN_CSV); assert all(c in extra.columns for c in _need), f"추가 데이터 열이 부족합니다: {list(extra.columns)}"
+    for c in ["question", "a", "b", "c", "d"]: extra[c] = extra[c].astype(str)
+    extra["answer"] = extra["answer"].astype(str).str.strip().str.lower(); assert set(extra.answer.unique()) <= set("abcd"), extra.answer.unique()
+    assert not (set(extra.id) & set(val_df.id)), "추가 데이터에 검증 문항이 섞여 있습니다"
+    assert extra.path.map(lambda p: os.path.exists(img_path(p))).all(), "추가 데이터의 이미지 경로가 없습니다"
+    if DRY_RUN: extra = extra.head(2)
+    train_src = pd.concat([train_src[_need], extra[_need]], ignore_index=True)
+    print(f"추가 학습 데이터 {len(extra):,}문항 합침 (정답 분포 {extra.answer.value_counts().sort_index().to_dict()}) → 학습 총 {len(train_src):,}문항")
+train_rows = train_src.to_dict("records")
+STEP_SAMPLES = MICRO_BS * GRAD_ACCUM
+steps_per_epoch = len(train_rows) // STEP_SAMPLES
+n_epochs = 1 if DRY_RUN else EPOCHS
+total_steps = steps_per_epoch * n_epochs
+if MAX_STEPS and not DRY_RUN: total_steps = min(total_steps, int(MAX_STEPS))
+assert total_steps > 0, "학습 샘플이 유효 배치보다 적습니다"
+print(f"학습 문항 {len(train_rows):,} | 유효 배치 {STEP_SAMPLES} | epoch당 {steps_per_epoch} 스텝 | 총 {total_steps} 스텝" + (" | ⚠️ 검증셋 포함 학습(TRAIN_ON_FULL)" if TRAIN_ON_FULL else ""))
+
+def epoch_plan(epoch):
+    rng = np.random.RandomState(TRAIN_SEED * 1000 + epoch)
+    order = rng.permutation(len(train_rows))
+    perms = [tuple(rng.permutation(4).tolist()) if SHUFFLE_OPTIONS else IDENTITY for _ in range(len(train_rows))]
+    return order, perms
+
+def gold_slot(row, perm):                 # 섞인 화면에서 정답이 놓인 자리 (0~3)
+    return perm.index(LETTERS.index(row["answer"]))
+
+def train_micro_step(rows, perms):
+    global _AUG_ON
+    _AUG_ON = True
+    try: enc = encode_batch(rows, perms)
+    finally: _AUG_ON = False
+    target = torch.tensor([LETTER_IDS[gold_slot(r, p)][0] for r, p in zip(rows, perms)], device=model.device)
+    logits = _last_logits(enc)
+    loss = F.cross_entropy(logits, target)
+    with torch.no_grad():
+        slot = torch.stack([logits[:, ids[0]] for ids in LETTER_IDS], dim=1)
+        hit = (slot.argmax(1).cpu() == torch.tensor([gold_slot(r, p) for r, p in zip(rows, perms)])).float().mean().item()
+    return loss, hit
+
+# ── 문자열 보조학습: 이미지+질문을 보고 '정답 문자열'을 그대로 쓰는 과제. 정답 부분 토큰에만 손실, 문항마다 평균(긴 답이 지배하지 않게) ──
+GEN_INSTRUCT = ("You are a helpful visual question answering assistant. "
+                "Read the text in the image and answer with the exact words only. No explanation.")
+aux_rows = []
+if AUX_GEN_CSV:
+    _aux = pd.read_csv(AUX_GEN_CSV)
+    assert all(c in _aux.columns for c in ["id", "path", "question", "answer_text"]), f"보조 데이터 열이 부족합니다: {list(_aux.columns)}"
+    _aux["question"] = _aux["question"].astype(str); _aux["answer_text"] = _aux["answer_text"].astype(str).str.strip()
+    assert not (set(_aux.id) & set(val_df.id)), "보조 데이터에 검증 문항이 섞여 있습니다"
+    assert _aux.path.map(lambda p: os.path.exists(img_path(p))).all(), "보조 데이터의 이미지 경로가 없습니다"
+    _ntok = _aux.answer_text.map(lambda a: len(processor.tokenizer(a, add_special_tokens=False).input_ids))
+    _aux = _aux[(_ntok >= 1) & (_ntok <= AUX_MAX_ANS_TOKENS) & (_aux.answer_text.str.len() > 0)]
+    if DRY_RUN: _aux = _aux.head(4)
+    aux_rows = _aux.to_dict("records")
+    AUX_ORDER = np.random.RandomState(TRAIN_SEED + 777).permutation(len(aux_rows))
+    print(f"문자열 보조학습 {len(aux_rows):,}문항 | 객관식 마이크로 배치 {AUX_GEN_EVERY}개마다 1개 | 가중치 {AUX_GEN_WEIGHT}")
+
+def build_gen_messages(row):
+    user_text = f"{row['question']}\n\n이미지에 적힌 그대로 짧게 답하세요."
+    if globals().get("USE_SYSTEM_ROLE", True):
+        _sys = GEN_INSTRUCT if globals().get("SYSTEM_AS_STRING", False) else [{"type": "text", "text": GEN_INSTRUCT}]
+        return [{"role": "system", "content": _sys},
+                {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": user_text}]}]
+    return [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": GEN_INSTRUCT + "\n\n" + user_text}]}]
+
+def gen_micro_step(rows):
+    global _AUG_ON
+    prompts = [_fix_prompt(processor.apply_chat_template(build_gen_messages(r), tokenize=False, add_generation_prompt=True, **TEMPLATE_KW)) for r in rows]
+    fulls = [p + r["answer_text"] for p, r in zip(prompts, rows)]
+    _AUG_ON = True
+    try: images = [load_image(r["path"]) for r in rows]; images = [augment_image(im) for im in images] if IMG_AUG else images
+    finally: _AUG_ON = False
+    imgs = [[im] for im in images] if FAMILY == "gemma4" else images
+    enc_p = processor(text=prompts, images=imgs, padding=True, return_tensors="pt", **PIXEL_KW)
+    enc = processor(text=fulls, images=imgs, padding=True, return_tensors="pt", **PIXEL_KW)
+    n_ans = (enc["attention_mask"].sum(1) - enc_p["attention_mask"].sum(1)).tolist()     # 왼쪽 패딩이라 정답 토큰은 끝에 붙어 있음
+    K = max(max(n_ans), 1) + 1
+    enc = enc.to(model.device)
+    with torch.autocast(device_type="cuda", dtype=DTYPE, enabled=(DEVICE == "cuda")):
+        out = model(**enc, logits_to_keep=K, use_cache=False)
+    logits = out.logits.float(); ids = enc["input_ids"]; L = ids.shape[1]
+    losses = []
+    for b, n in enumerate(n_ans):
+        if n < 1: continue
+        tgt = ids[b, L - n:]
+        losses.append(F.cross_entropy(logits[b, K - n - 1: K - 1], tgt))
+    return torch.stack(losses).mean() if losses else None
+
+def aux_batch(step, s):
+    # 스텝·마이크로 위치로 결정적으로 고름 → 중단 후 재개해도 같은 보조 문항
+    micro = step * max(1, STEP_SAMPLES // MICRO_BS) + s // MICRO_BS
+    if not aux_rows or (micro + 1) % AUX_GEN_EVERY: return None
+    g = (micro + 1) // AUX_GEN_EVERY - 1
+    return [aux_rows[AUX_ORDER[(g * MICRO_BS + j) % len(aux_rows)]] for j in range(MICRO_BS)]
+
+params = [p for p in model.parameters() if p.requires_grad]
+optimizer = torch.optim.AdamW(params, lr=LR, weight_decay=0.0)
+scheduler = get_cosine_schedule_with_warmup(optimizer, max(1, int(total_steps * WARMUP_RATIO)), total_steps)
+scaler = torch.amp.GradScaler("cuda", enabled=USE_FP16_SCALER)
+state = {"global_step": 0, "history": [], "epoch_acc": {}, "config": {k: globals()[k] for k in
+         ["MODEL_ID", "TRAIN_PRESET", "EPOCHS", "MAX_STEPS", "LR", "STEP_SAMPLES", "LORA_R", "LORA_ALPHA", "SHUFFLE_OPTIONS", "TRAIN_ON_FULL", "SEED", "TRAIN_SEED", "EXTRA_TRAIN_CSV", "IMG_AUG", "TRAIN_PRESETS", "AUX_GEN_CSV", "AUX_GEN_EVERY", "AUX_GEN_WEIGHT"]}}
+
+def save_checkpoint():
+    tmp = CKPT_DIR + "_tmp"; os.makedirs(tmp, exist_ok=True)
+    model.save_pretrained(os.path.join(tmp, "adapter"))
+    rng = {"py": random.getstate(), "np": np.random.get_state(), "torch": torch.get_rng_state(),
+           "cuda": torch.cuda.get_rng_state_all() if DEVICE == "cuda" else None}
+    torch.save({"optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
+                "state": state, "rng": rng}, os.path.join(tmp, "trainer_state.pt"))
+    if os.path.exists(CKPT_DIR): shutil.rmtree(CKPT_DIR)
+    os.replace(tmp, CKPT_DIR)                     # 저장 도중 끊겨도 이전 체크포인트가 깨지지 않도록 교체 방식으로
+
+if RESUMING:
+    ck = torch.load(os.path.join(CKPT_DIR, "trainer_state.pt"), map_location="cpu", weights_only=False)
+    _defaults = {"TRAIN_SEED": 42, "MAX_STEPS": None, "EXTRA_TRAIN_CSV": None, "IMG_AUG": False, "TRAIN_PRESETS": None, "AUX_GEN_CSV": None, "AUX_GEN_EVERY": 5, "AUX_GEN_WEIGHT": 1.0}
+    same = all(ck["state"]["config"].get(k, _defaults.get(k)) == v for k, v in state["config"].items())
+    assert same, f"체크포인트의 설정이 현재와 다릅니다. RUN_NAME을 바꾸거나 설정을 되돌리세요.\n저장됨: {ck['state']['config']}\n현재: {state['config']}"
+    optimizer.load_state_dict(ck["optimizer"]); scheduler.load_state_dict(ck["scheduler"]); scaler.load_state_dict(ck["scaler"])
+    state = ck["state"]
+    random.setstate(ck["rng"]["py"]); np.random.set_state(ck["rng"]["np"]); torch.set_rng_state(ck["rng"]["torch"])
+    if DEVICE == "cuda" and ck["rng"]["cuda"] is not None: torch.cuda.set_rng_state_all(ck["rng"]["cuda"])
+    print(f"↩️ {state['global_step']}/{total_steps} 스텝부터 이어서 학습합니다")

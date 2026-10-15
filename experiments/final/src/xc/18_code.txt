@@ -1,0 +1,28 @@
+import vllm, contextlib, io, sys
+from vllm import LLM, SamplingParams
+try:
+    sys.stdout.fileno(); _FILENO_OK = True
+except (io.UnsupportedOperation, AttributeError, ValueError):
+    _FILENO_OK = False
+if not _FILENO_OK:
+    # Colab 노트북의 출력 스트림에는 파일 번호가 없음. vLLM은 분산 초기화 때 C 라이브러리 출력을 숨기려고 sys.stdout.fileno()를 부르다 멈춤
+    # (엔진을 노트북 프로세스 안에서 돌리기 때문) → 그 숨기기 기능만 끔. 결과에는 영향 없고, gloo 초기화 메시지가 숨겨지지 않을 뿐
+    import vllm.utils.system_utils as _su, vllm.distributed.parallel_state as _ps, vllm.distributed.utils as _du
+    @contextlib.contextmanager
+    def _no_suppress_stdout(): yield
+    for _mod in (_su, _ps, _du): _mod.suppress_stdout = _no_suppress_stdout
+    print("Colab 출력 스트림 → vLLM의 stdout 숨기기(suppress_stdout)를 끔")
+if "llm" not in globals():
+    t0 = time.time()
+    llm = LLM(model=MODEL_ID, quantization=QUANTIZATION, dtype=DTYPE, max_model_len=MAX_MODEL_LEN, trust_remote_code=TRUST_REMOTE_CODE,
+              gpu_memory_utilization=GPU_MEM_UTIL, max_num_seqs=MAX_NUM_SEQS, max_num_batched_tokens=MAX_BATCHED_TOKENS,
+              limit_mm_per_prompt={"image": 1, "video": 0}, mm_processor_kwargs=MM_KW, mm_processor_cache_gb=0,
+              enforce_eager=True, enable_prefix_caching=False, max_logprobs=TOPK_LOGPROBS, seed=SEED, moe_backend=MOE_BACKEND,
+              gdn_prefill_backend=GDN_PREFILL_BACKEND, **ENGINE_KW)
+    print(f"모델 로드 {time.time() - t0:.0f}s")
+else:
+    print("이미 로드된 모델을 그대로 씀 (설정을 바꿨다면 세션을 다시 시작하세요)")
+GPU_NAME = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+_free, _tot = torch.cuda.mem_get_info() if torch.cuda.is_available() else (0, 0)
+print(f"vllm {vllm.__version__} | {MODEL_ID} | {GPU_NAME} | GPU 사용 {(_tot - _free) / 2**30:.1f} / {_tot / 2**30:.0f}GiB")
+SP = SamplingParams(max_tokens=1, temperature=0.0, logprobs=TOPK_LOGPROBS, detokenize=False)

@@ -1,0 +1,22 @@
+EXPECTED_SPLIT_MD5 = "df05e4bc19d27ebceeef2570672149c2"
+
+def make_split(df, val_size=VAL_SIZE, seed=SEED):
+    rng = np.random.RandomState(seed)
+    val_idx = []
+    for letter in "abcd":
+        idx = np.where(df.answer.values == letter)[0]
+        rng.shuffle(idx)
+        val_idx.extend(idx[: val_size // 4].tolist())
+    val_idx = sorted(val_idx)
+    mask = np.zeros(len(df), dtype=bool); mask[val_idx] = True
+    return df[~mask].reset_index(drop=True), df[mask].reset_index(drop=True)
+
+tr_df, val_df = make_split(train_df)
+split_md5 = hashlib.md5(",".join(val_df.id.tolist()).encode()).hexdigest()
+print(f"train {len(tr_df):,} / valid {len(val_df):,} | split md5 = {split_md5}")
+print("valid 정답 분포:", val_df.answer.value_counts().sort_index().to_dict())
+if split_md5 == EXPECTED_SPLIT_MD5:
+    print("✅ 팀 공통 분할과 일치")
+else:
+    print("⚠️⚠️ 검증 분할이 기준과 다릅니다 → 팀원 간 점수 비교 불가. train.csv 원본/SEED/VAL_SIZE를 확인하세요.")
+val_df[["id"]].to_csv(os.path.join(OUT_DIR, "valid_ids.csv"), index=False)
